@@ -42,7 +42,7 @@ const (
 	devKey       = "x7f54tgbdyc64y656thy47er4"
 	clientId     = "Eg7HuH873H65r5rt325UytR5429"
 	layout       = "01/02/2006 15:04:05"
-	userAgent    = "NugsNet/4.4.2 (Android; 7.1.2; Asus; ASUS_Z01QD; Scale/2.0; en)"
+	userAgent    = "NugsNet/4.4.2 (Android; 16; Samsung; SM-S931U; Scale/2.0; en)"
 	userAgentTwo = "nugsnetAndroid"
 	authUrl      = "https://id.nugs.net/connect/token"
 	subInfoUrl   = "https://subscriptions.nugs.net/api/v1/me/subscriptions"

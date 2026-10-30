@@ -1,4 +1,4 @@
-module github.com/vincentmele/Nugs-Downloader
+module nugs_dl
 
 go 1.27.3
 

@@ -9,11 +9,10 @@ Nugs downloader written in Go - original by Sorrow446, patched & compiled by Gav
 # Building
 Requires Go (see `go.mod` for the version).
 ```
-go build -o nugs_dl .
+go build
 go test ./...
 ```
-
-It's pure Go, so it cross-compiles to a single self-contained file for any platform, e.g. `GOOS=windows GOARCH=amd64 go build -o nugs_dl.exe .` or `GOOS=linux GOARCH=arm64 go build -o nugs_dl .`
+This produces `nugs_dl` (`nugs_dl.exe` on Windows). It's pure Go, so it cross-compiles to a single self-contained file for any platform, e.g. `GOOS=windows GOARCH=amd64 go build` or `GOOS=linux GOARCH=arm64 go build`.
 
 # Setup
 Put these files next to the binary.

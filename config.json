@@ -1,9 +1,0 @@
-{
-    "email": "",
-    "password": "",
-    "format": 4,
-    "videoFormat": 5,
-    "outPath": "Saved Music",
-    "token": "",
-    "useFfmpegEnvVar": false
-}

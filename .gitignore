@@ -1,0 +1,14 @@
+# Build output
+/main
+/Nugs-Downloader
+/nugs_dl*
+*.exe
+
+# Runtime files next to the binary
+/ffmpeg
+/Nugs downloads/
+/Saved Music/
+
+# Local settings and credentials (see config.example.json and .env.example)
+/config.json
+/.env

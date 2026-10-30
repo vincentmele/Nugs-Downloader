@@ -3,82 +3,108 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"cmp"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+	"unicode/utf8"
 
+	"github.com/Eyevinn/hls-m3u8/m3u8"
 	"github.com/alexflint/go-arg"
 	"github.com/dustin/go-humanize"
-	"github.com/grafov/m3u8"
+	"github.com/joho/godotenv"
 )
 
 const (
-	devKey         = "x7f54tgbdyc64y656thy47er4"
-	clientId       = "Eg7HuH873H65r5rt325UytR5429"
-	layout         = "01/02/2006 15:04:05"
-	userAgent      = "NugsNet/3.26.724 (Android; 7.1.2; Asus; ASUS_Z01QD; Scale/2.0; en)"
-	userAgentTwo   = "nugsnetAndroid"
-	authUrl        = "https://id.nugs.net/connect/token"
-	streamApiBase  = "https://streamapi.nugs.net/"
-	subInfoUrl     = "https://subscriptions.nugs.net/api/v1/me/subscriptions"
-	userInfoUrl    = "https://id.nugs.net/connect/userinfo"
-	playerUrl      = "https://play.nugs.net/"
-	sanRegexStr    = `[\/:*?"><|]`
-	chapsFileFname = "chapters_nugs_dl_tmp.txt"
-	durRegex       = `Duration: ([\d:.]+)`
-	bitrateRegex   = `[\w]+(?:_(\d+)k_v\d+)`
+	devKey       = "x7f54tgbdyc64y656thy47er4"
+	clientId     = "Eg7HuH873H65r5rt325UytR5429"
+	layout       = "01/02/2006 15:04:05"
+	userAgent    = "NugsNet/3.26.724 (Android; 7.1.2; Asus; ASUS_Z01QD; Scale/2.0; en)"
+	userAgentTwo = "nugsnetAndroid"
+	authUrl      = "https://id.nugs.net/connect/token"
+	subInfoUrl   = "https://subscriptions.nugs.net/api/v1/me/subscriptions"
+	userInfoUrl  = "https://id.nugs.net/connect/userinfo"
+	playerUrl    = "https://play.nugs.net/"
+	configFile   = "config.json"
+	envFile      = ".env"
 )
+
+// exitInterrupted is the conventional exit status for a process stopped by SIGINT.
+const exitInterrupted = 130
+
+const banner = `
+ _____                ____                _           _
+|   | |_ _ ___ ___   |    \ ___ _ _ _ ___| |___ ___ _| |___ ___
+| | | | | | . |_ -|  |  |  | . | | | |   | | . | .'| . | -_|  _|
+|_|___|___|_  |___|  |____/|___|_____|_|_|_|___|__,|___|___|_|
+          |___|
+
+`
+
+var client = newClient()
+
+// streamApiBase is a variable so tests can point it at a local server.
+var streamApiBase = "https://streamapi.nugs.net/"
 
 var (
-	jar, _ = cookiejar.New(nil)
-	client = &http.Client{Jar: jar}
+	sanRegex     = regexp.MustCompile(`[/:*?"><|\x00-\x1f]`)
+	durRegex     = regexp.MustCompile(`Duration: ([\d:.]+)`)
+	bitrateRegex = regexp.MustCompile(`[\w]+(?:_(\d+)k_v\d+)`)
 )
 
-var regexStrings = [11]string{
-	`^https://play.nugs.net/release/(\d+)$`,
-	`^https://play.nugs.net/#/playlists/playlist/(\d+)$`,
-	`^https://play.nugs.net/library/playlist/(\d+)$`,
-	`(^https://2nu.gs/[a-zA-Z\d]+$)`,
-	`^https://play.nugs.net/#/videos/artist/\d+/.+/(\d+)$`,
-	`^https://play.nugs.net/artist/(\d+)(?:/albums|/latest|)$`,
-	`^https://play.nugs.net/livestream/(\d+)/exclusive$`,
-	`^https://play.nugs.net/watch/livestreams/exclusive/(\d+)$`,
-	`^https://play.nugs.net/#/my-webcasts/\d+-(\d+)-\d+-\d+$`,
-	`^https://www.nugs.net/on/demandware.store/Sites-NugsNet-Site/d`+
-		`efault/(?:Stash-QueueVideo|NugsVideo-GetStashVideo)\?([a-zA-Z0-9=%&-]+$)`,
-	`^https://play.nugs.net/library/webcast/(\d+)$`,
+// The index of the first matching pattern selects the media type in run.
+var urlRegexes = []*regexp.Regexp{
+	regexp.MustCompile(`^https://play\.nugs\.net/release/(\d+)$`),
+	regexp.MustCompile(`^https://play\.nugs\.net/#/playlists/playlist/(\d+)$`),
+	regexp.MustCompile(`^https://play\.nugs\.net/library/playlist/(\d+)$`),
+	regexp.MustCompile(`^(https://2nu\.gs/[a-zA-Z\d]+)$`),
+	regexp.MustCompile(`^https://play\.nugs\.net/#/videos/artist/\d+/.+/(\d+)$`),
+	regexp.MustCompile(`^https://play\.nugs\.net/artist/(\d+)(?:/albums|/latest|)$`),
+	regexp.MustCompile(`^https://play\.nugs\.net/livestream/(\d+)/exclusive$`),
+	regexp.MustCompile(`^https://play\.nugs\.net/watch/livestreams/exclusive/(\d+)$`),
+	regexp.MustCompile(`^https://play\.nugs\.net/#/my-webcasts/\d+-(\d+)-\d+-\d+$`),
+	regexp.MustCompile(`^https://www\.nugs\.net/on/demandware\.store/Sites-NugsNet-Site/default/` +
+		`(?:Stash-QueueVideo|NugsVideo-GetStashVideo)\?([a-zA-Z0-9=%&-]+)$`),
+	regexp.MustCompile(`^https://play\.nugs\.net/library/webcast/(\d+)$`),
 }
 
-var qualityMap = map[string]Quality{
-	".alac16/": {Specs: "16-bit / 44.1 kHz ALAC", Extension: ".m4a", Format: 1},
-	".flac16/": {Specs: "16-bit / 44.1 kHz FLAC", Extension: ".flac", Format: 2},
-	// .mqa24/ must be above .flac?
-	".mqa24/":  {Specs: "24-bit / 48 kHz MQA", Extension: ".flac", Format: 3},
-	".flac?": {Specs: "FLAC", Extension: ".flac", Format: 2},
-	".s360/":   {Specs: "360 Reality Audio", Extension: ".mp4", Format: 4},
-	".aac150/": {Specs: "150 Kbps AAC", Extension: ".m4a", Format: 5},
-	".m4a?": {Specs: "AAC", Extension: ".m4a", Format: 5},
-	".m3u8?":	{Extension: ".m4a", Format: 6},
+// The first marker found in a stream URL wins, so HLS manifests come first and
+// codec paths come before bare extensions (an ALAC URL also contains ".m4a?").
+var streamQualities = []struct {
+	marker  string
+	quality Quality
+}{
+	{".m3u8?", Quality{Extension: ".m4a", Format: 6}},
+	{".alac16/", Quality{Specs: "16-bit / 44.1 kHz ALAC", Extension: ".m4a", Format: 1}},
+	{".flac16/", Quality{Specs: "16-bit / 44.1 kHz FLAC", Extension: ".flac", Format: 2}},
+	{".mqa24/", Quality{Specs: "24-bit / 48 kHz MQA", Extension: ".flac", Format: 3}},
+	{".s360/", Quality{Specs: "360 Reality Audio", Extension: ".mp4", Format: 4}},
+	{".aac150/", Quality{Specs: "150 Kbps AAC", Extension: ".m4a", Format: 5}},
+	{".flac?", Quality{Specs: "FLAC", Extension: ".flac", Format: 2}},
+	{".m4a?", Quality{Specs: "AAC", Extension: ".m4a", Format: 5}},
 }
 
 var resolveRes = map[int]string{
@@ -102,27 +128,42 @@ var resFallback = map[string]string{
 	"1440": "1080",
 }
 
+func newClient() *http.Client {
+	jar, _ := cookiejar.New(nil)
+	// No overall timeout since downloads can take a long time, but don't wait forever on a
+	// server that never answers.
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ResponseHeaderTimeout = time.Minute
+	return &http.Client{Jar: jar, Transport: t}
+}
+
+func newWriteCounter(total int64) *WriteCounter {
+	wc := &WriteCounter{Total: total, TotalStr: "?", StartTime: time.Now()}
+	if total > 0 {
+		wc.TotalStr = humanize.Bytes(uint64(total))
+	}
+	return wc
+}
+
 func (wc *WriteCounter) Write(p []byte) (int, error) {
-	var speed int64 = 0
 	n := len(p)
 	wc.Downloaded += int64(n)
-	percentage := float64(wc.Downloaded) / float64(wc.Total) * float64(100)
-	wc.Percentage = int(percentage)
-	toDivideBy := time.Now().UnixMilli() - wc.StartTime
-	if toDivideBy != 0 {
-		speed = int64(wc.Downloaded) / toDivideBy * 1000
+	var speed float64
+	if elapsed := time.Since(wc.StartTime).Seconds(); elapsed > 0 {
+		speed = float64(wc.Downloaded) / elapsed
 	}
-	fmt.Printf("\r%d%% @ %s/s, %s/%s ", wc.Percentage, humanize.Bytes(uint64(speed)),
-		humanize.Bytes(uint64(wc.Downloaded)), wc.TotalStr)
+	speedStr := humanize.Bytes(uint64(speed))
+	downloadedStr := humanize.Bytes(uint64(wc.Downloaded))
+	if wc.Total > 0 {
+		fmt.Printf("\r%d%% @ %s/s, %s/%s ", wc.Downloaded*100/wc.Total, speedStr, downloadedStr, wc.TotalStr)
+	} else {
+		fmt.Printf("\r%s/s, %s ", speedStr, downloadedStr)
+	}
 	return n, nil
 }
 
-func handleErr(errText string, err error, _panic bool) {
-	errString := errText + "\n" + err.Error()
-	if _panic {
-		panic(errString)
-	}
-	fmt.Println(errString)
+func printErr(errText string, err error) {
+	fmt.Fprintf(os.Stderr, "%s\n%v\n", errText, err)
 }
 
 func wasRunFromSrc() bool {
@@ -136,8 +177,7 @@ func getScriptDir() (string, error) {
 		err   error
 		fname string
 	)
-	runFromSrc := wasRunFromSrc()
-	if runFromSrc {
+	if wasRunFromSrc() {
 		_, fname, _, ok = runtime.Caller(0)
 		if !ok {
 			return "", errors.New("failed to get script filename")
@@ -153,7 +193,7 @@ func getScriptDir() (string, error) {
 
 func readTxtFile(path string) ([]string, error) {
 	var lines []string
-	f, err := os.OpenFile(path, os.O_RDONLY, 0755)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
@@ -165,52 +205,52 @@ func readTxtFile(path string) ([]string, error) {
 			lines = append(lines, line)
 		}
 	}
-	if scanner.Err() != nil {
-		return nil, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return nil, err
 	}
 	return lines, nil
 }
 
 func contains(lines []string, value string) bool {
-	for _, line := range lines {
-		if strings.EqualFold(line, value) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(lines, func(line string) bool {
+		return strings.EqualFold(line, value)
+	})
 }
 
 func processUrls(urls []string) ([]string, error) {
-	var (
-		processed []string
-		txtPaths  []string
-	)
-	for _, _url := range urls {
-		if strings.HasSuffix(_url, ".txt") && !contains(txtPaths, _url) {
-			txtLines, err := readTxtFile(_url)
-			if err != nil {
-				return nil, err
-			}
-			for _, txtLine := range txtLines {
-				if !contains(processed, txtLine) {
-					txtLine = strings.TrimSuffix(txtLine, "/")
-					processed = append(processed, txtLine)
-				}
-			}
-			txtPaths = append(txtPaths, _url)
-		} else {
-			if !contains(processed, _url) {
-				_url = strings.TrimSuffix(_url, "/")
-				processed = append(processed, _url)
-			}
+	var processed, txtPaths []string
+	add := func(u string) {
+		u = strings.TrimSuffix(u, "/")
+		if !contains(processed, u) {
+			processed = append(processed, u)
 		}
+	}
+	for _, u := range urls {
+		if !strings.HasSuffix(u, ".txt") {
+			add(u)
+			continue
+		}
+		if contains(txtPaths, u) {
+			continue
+		}
+		txtLines, err := readTxtFile(u)
+		if err != nil {
+			return nil, err
+		}
+		for _, txtLine := range txtLines {
+			add(txtLine)
+		}
+		txtPaths = append(txtPaths, u)
 	}
 	return processed, nil
 }
 
 func parseCfg() (*Config, error) {
-	cfg, err := readConfig()
+	cfg, err := readConfig(configFile)
 	if err != nil {
+		return nil, err
+	}
+	if err := loadCredentials(cfg, envFile); err != nil {
 		return nil, err
 	}
 	args := parseArgs()
@@ -220,10 +260,10 @@ func parseCfg() (*Config, error) {
 	if args.VideoFormat != -1 {
 		cfg.VideoFormat = args.VideoFormat
 	}
-	if !(cfg.Format >= 1 && cfg.Format <= 5) {
-		return nil, errors.New("track Format must be between 1 and 5")
+	if cfg.Format < 1 || cfg.Format > 5 {
+		return nil, errors.New("track format must be between 1 and 5")
 	}
-	if !(cfg.VideoFormat >= 1 && cfg.VideoFormat <= 5) {
+	if cfg.VideoFormat < 1 || cfg.VideoFormat > 5 {
 		return nil, errors.New("video format must be between 1 and 5")
 	}
 	cfg.WantRes = resolveRes[cfg.VideoFormat]
@@ -233,9 +273,7 @@ func parseCfg() (*Config, error) {
 	if cfg.OutPath == "" {
 		cfg.OutPath = "Nugs downloads"
 	}
-	if cfg.Token != "" {
-		cfg.Token = strings.TrimPrefix(cfg.Token, "Bearer ")
-	}
+	cfg.Token = strings.TrimPrefix(cfg.Token, "Bearer ")
 	if cfg.UseFfmpegEnvVar {
 		cfg.FfmpegNameStr = "ffmpeg"
 	} else {
@@ -243,8 +281,7 @@ func parseCfg() (*Config, error) {
 	}
 	cfg.Urls, err = processUrls(args.Urls)
 	if err != nil {
-		fmt.Println("Failed to process URLs.")
-		return nil, err
+		return nil, fmt.Errorf("process URLs: %w", err)
 	}
 	cfg.ForceVideo = args.ForceVideo
 	cfg.SkipVideos = args.SkipVideos
@@ -252,17 +289,64 @@ func parseCfg() (*Config, error) {
 	return cfg, nil
 }
 
-func readConfig() (*Config, error) {
-	data, err := ioutil.ReadFile("config.json")
-	if err != nil {
+func readConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("%s not found; copy config.example.json to %s and edit it", path, path)
+	} else if err != nil {
 		return nil, err
 	}
 	var obj Config
-	err = json.Unmarshal(data, &obj)
-	if err != nil {
-		return nil, err
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return &obj, nil
+}
+
+// loadCredentials fills in the account details from environment variables or the
+// .env file at envPath, with real environment variables taking precedence. The
+// credentials are treated as one set: if any are found there, any in config.json
+// are ignored.
+func loadCredentials(cfg *Config, envPath string) error {
+	dotenv, err := godotenv.Read(envPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read %s: %w", envPath, err)
+	}
+	lookup := func(key string) string {
+		if v, ok := os.LookupEnv(key); ok {
+			return v
+		}
+		return dotenv[key]
+	}
+	email, password, token := lookup("NUGS_EMAIL"), lookup("NUGS_PASSWORD"), lookup("NUGS_TOKEN")
+	if email != "" || password != "" || token != "" {
+		cfg.Email, cfg.Password, cfg.Token = email, password, token
+		if len(dotenv) > 0 {
+			warnIfExposed(envPath)
+		}
+		return nil
+	}
+	if cfg.Email != "" || cfg.Password != "" || cfg.Token != "" {
+		fmt.Fprintf(os.Stderr,
+			"Warning: credentials in %s are deprecated. Move them to %s (see .env.example).\n",
+			configFile, envPath)
+		warnIfExposed(configFile)
+	}
+	return nil
+}
+
+// warnIfExposed nudges the user when a file holding their credentials is readable
+// by other accounts on the machine.
+func warnIfExposed(path string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	fi, err := os.Stat(path)
+	if err == nil && fi.Mode().Perm()&0o077 != 0 {
+		fmt.Fprintf(os.Stderr,
+			"Warning: %s contains credentials and is readable by other users. Run: chmod 600 %s\n",
+			path, path)
+	}
 }
 
 func parseArgs() *Args {
@@ -272,95 +356,133 @@ func parseArgs() *Args {
 }
 
 func makeDirs(path string) error {
-	err := os.MkdirAll(path, 0755)
-	return err
+	return os.MkdirAll(path, 0755)
 }
 
 func fileExists(path string) (bool, error) {
 	f, err := os.Stat(path)
 	if err == nil {
 		return !f.IsDir(), nil
-	} else if os.IsNotExist(err) {
+	} else if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
 	return false, err
 }
 
+// sanitise makes an API-provided name safe to use as a single path component.
 func sanitise(filename string) string {
-	san := regexp.MustCompile(sanRegexStr).ReplaceAllString(filename, "_")
-	return strings.TrimSuffix(san, "\t")
+	san := sanRegex.ReplaceAllString(strings.TrimSuffix(filename, "\t"), "_")
+	if os.PathSeparator == '\\' {
+		san = strings.ReplaceAll(san, `\`, "_")
+	}
+	if san == "." || san == ".." {
+		return strings.Repeat("_", len(san))
+	}
+	return san
 }
 
-func auth(email, pwd string) (string, error) {
+// truncate shortens s to at most n bytes without splitting a UTF-8 sequence.
+func truncate(s string, n int) (string, bool) {
+	if len(s) <= n {
+		return s, false
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n], true
+}
+
+// partPath returns the name a file is written under until it's complete. The
+// extension is kept so ffmpeg can still infer the output container.
+func partPath(path string) string {
+	ext := filepath.Ext(path)
+	return strings.TrimSuffix(path, ext) + ".part" + ext
+}
+
+// redactURLError strips the query string, which can carry the user's legacy
+// token, from request errors before they're printed.
+func redactURLError(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		if u, perr := url.Parse(urlErr.URL); perr == nil {
+			u.RawQuery = ""
+			urlErr.URL = u.String()
+		}
+	}
+	return err
+}
+
+func httpGet(ctx context.Context, rawUrl string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawUrl, nil)
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(req)
+}
+
+// doJSON sends req and decodes a 200 response body into v.
+func doJSON(req *http.Request, ua string, v any) error {
+	req.Header.Set("User-Agent", ua)
+	resp, err := client.Do(req)
+	if err != nil {
+		return redactURLError(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return errors.New(resp.Status)
+	}
+	return json.NewDecoder(resp.Body).Decode(v)
+}
+
+func apiGet(ctx context.Context, path string, query url.Values, ua string, v any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamApiBase+path, nil)
+	if err != nil {
+		return err
+	}
+	req.URL.RawQuery = query.Encode()
+	return doJSON(req, ua, v)
+}
+
+func auth(ctx context.Context, email, pwd string) (string, error) {
 	data := url.Values{}
 	data.Set("client_id", clientId)
 	data.Set("grant_type", "password")
 	data.Set("scope", "openid profile email nugsnet:api nugsnet:legacyapi offline_access")
 	data.Set("username", email)
 	data.Set("password", pwd)
-	req, err := http.NewRequest(http.MethodPost, authUrl, strings.NewReader(data.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, authUrl, strings.NewReader(data.Encode()))
 	if err != nil {
 		return "", err
 	}
-	req.Header.Add("User-Agent", userAgent)
-	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-	do, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer do.Body.Close()
-	if do.StatusCode != http.StatusOK {
-		return "", errors.New(do.Status)
-	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	var obj Auth
-	err = json.NewDecoder(do.Body).Decode(&obj)
-	if err != nil {
+	if err := doJSON(req, userAgent, &obj); err != nil {
 		return "", err
 	}
 	return obj.AccessToken, nil
 }
 
-func getUserInfo(token string) (string, error) {
-	req, err := http.NewRequest(http.MethodGet, userInfoUrl, nil)
+func getUserInfo(ctx context.Context, token string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, userInfoUrl, nil)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Add("Authorization", "Bearer "+token)
-	req.Header.Add("User-Agent", userAgent)
-	do, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer do.Body.Close()
-	if do.StatusCode != http.StatusOK {
-		return "", errors.New(do.Status)
-	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	var obj UserInfo
-	err = json.NewDecoder(do.Body).Decode(&obj)
-	if err != nil {
+	if err := doJSON(req, userAgent, &obj); err != nil {
 		return "", err
 	}
 	return obj.Sub, nil
 }
 
-func getSubInfo(token string) (*SubInfo, error) {
-	req, err := http.NewRequest(http.MethodGet, subInfoUrl, nil)
+func getSubInfo(ctx context.Context, token string) (*SubInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, subInfoUrl, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Add("Authorization", "Bearer "+token)
-	req.Header.Add("User-Agent", userAgent)
-	do, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer do.Body.Close()
-	if do.StatusCode != http.StatusOK {
-		return nil, errors.New(do.Status)
-	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	var obj SubInfo
-	err = json.NewDecoder(do.Body).Decode(&obj)
-	if err != nil {
+	if err := doJSON(req, userAgent, &obj); err != nil {
 		return nil, err
 	}
 	return &obj, nil
@@ -369,9 +491,8 @@ func getSubInfo(token string) (*SubInfo, error) {
 func getPlan(subInfo *SubInfo) (string, bool) {
 	if !reflect.ValueOf(subInfo.Plan).IsZero() {
 		return subInfo.Plan.Description, false
-	} else {
-		return subInfo.Promo.Plan.Description, true
 	}
+	return subInfo.Promo.Plan.Description, true
 }
 
 func parseTimestamps(start, end string) (string, string) {
@@ -393,17 +514,13 @@ func parseStreamParams(userId string, subInfo *SubInfo, isPromo bool) *StreamPar
 	}
 	if isPromo {
 		streamParams.SubCostplanIDAccessList = subInfo.Promo.Plan.PlanID
-	} else {
-		streamParams.SubCostplanIDAccessList = subInfo.Plan.PlanID
 	}
 	return streamParams
 }
 
-func checkUrl(_url string) (string, int) {
-	for i, regexStr := range regexStrings {
-		regex := regexp.MustCompile(regexStr)
-		match := regex.FindStringSubmatch(_url)
-		if match != nil {
+func checkUrl(itemUrl string) (string, int) {
+	for i, regex := range urlRegexes {
+		if match := regex.FindStringSubmatch(itemUrl); match != nil {
 			return match[1], i
 		}
 	}
@@ -411,59 +528,38 @@ func checkUrl(_url string) (string, int) {
 }
 
 func extractLegToken(tokenStr string) (string, string, error) {
-	payload := strings.SplitN(tokenStr, ".", 3)[1]
-	decoded, err := base64.RawURLEncoding.DecodeString(payload)
+	parts := strings.Split(tokenStr, ".")
+	if len(parts) != 3 {
+		return "", "", errors.New("token is not a valid JWT")
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		return "", "", err
 	}
 	var obj Payload
-	err = json.Unmarshal(decoded, &obj)
-	if err != nil {
+	if err := json.Unmarshal(decoded, &obj); err != nil {
 		return "", "", err
 	}
 	return obj.LegacyToken, obj.LegacyUguid, nil
 }
 
-func getAlbumMeta(albumId string) (*AlbumMeta, error) {
-	req, err := http.NewRequest(http.MethodGet, streamApiBase+"api.aspx", nil)
-	if err != nil {
-		return nil, err
-	}
+func getAlbumMeta(ctx context.Context, albumId string) (*AlbumMeta, error) {
 	query := url.Values{}
 	query.Set("method", "catalog.container")
 	query.Set("containerID", albumId)
 	query.Set("vdisp", "1")
-	req.URL.RawQuery = query.Encode()
-	req.Header.Add("User-Agent", userAgent)
-	do, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer do.Body.Close()
-	if do.StatusCode != http.StatusOK {
-		return nil, errors.New(do.Status)
-	}
 	var obj AlbumMeta
-	err = json.NewDecoder(do.Body).Decode(&obj)
-	if err != nil {
+	if err := apiGet(ctx, "api.aspx", query, userAgent, &obj); err != nil {
 		return nil, err
 	}
 	return &obj, nil
 }
 
-func getPlistMeta(plistId, email, legacyToken string, cat bool) (*PlistMeta, error) {
-	var path string
-	if cat {
-		path = "api.aspx"
-	} else {
-		path = "secureApi.aspx"
-	}
-	req, err := http.NewRequest(http.MethodGet, streamApiBase+path, nil)
-	if err != nil {
-		return nil, err
-	}
+func getPlistMeta(ctx context.Context, plistId, email, legacyToken string, cat bool) (*PlistMeta, error) {
+	path := "secureApi.aspx"
 	query := url.Values{}
 	if cat {
+		path = "api.aspx"
 		query.Set("method", "catalog.playlist")
 		query.Set("plGUID", plistId)
 	} else {
@@ -473,25 +569,14 @@ func getPlistMeta(plistId, email, legacyToken string, cat bool) (*PlistMeta, err
 		query.Set("user", email)
 		query.Set("token", legacyToken)
 	}
-	req.URL.RawQuery = query.Encode()
-	req.Header.Add("User-Agent", userAgentTwo)
-	do, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer do.Body.Close()
-	if do.StatusCode != http.StatusOK {
-		return nil, errors.New(do.Status)
-	}
 	var obj PlistMeta
-	err = json.NewDecoder(do.Body).Decode(&obj)
-	if err != nil {
+	if err := apiGet(ctx, path, query, userAgentTwo, &obj); err != nil {
 		return nil, err
 	}
 	return &obj, nil
 }
 
-func getArtistMeta(artistId string) ([]*ArtistMeta, error) {
+func getArtistMeta(ctx context.Context, artistId string) ([]*ArtistMeta, error) {
 	var allArtistMeta []*ArtistMeta
 	offset := 1
 	query := url.Values{}
@@ -501,25 +586,9 @@ func getArtistMeta(artistId string) ([]*ArtistMeta, error) {
 	query.Set("availType", "1")
 	query.Set("vdisp", "1")
 	for {
-		req, err := http.NewRequest(http.MethodGet, streamApiBase+"api.aspx", nil)
-		if err != nil {
-			return nil, err
-		}
 		query.Set("startOffset", strconv.Itoa(offset))
-		req.URL.RawQuery = query.Encode()
-		req.Header.Add("User-Agent", userAgent)
-		do, err := client.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		if do.StatusCode != http.StatusOK {
-			do.Body.Close()
-			return nil, errors.New(do.Status)
-		}
 		var obj ArtistMeta
-		err = json.NewDecoder(do.Body).Decode(&obj)
-		do.Body.Close()
-		if err != nil {
+		if err := apiGet(ctx, "api.aspx", query, userAgent, &obj); err != nil {
 			return nil, err
 		}
 		retLen := len(obj.Response.Containers)
@@ -532,40 +601,21 @@ func getArtistMeta(artistId string) ([]*ArtistMeta, error) {
 	return allArtistMeta, nil
 }
 
-func getPurchasedManUrl(skuID int, showID, userID, uguID string) (string, error) {
-	req, err := http.NewRequest(http.MethodGet, streamApiBase+"bigriver/vidPlayer.aspx", nil)
-	if err != nil {
-		return "", err
-	}
+func getPurchasedManUrl(ctx context.Context, skuID int, showID, userID, uguID string) (string, error) {
 	query := url.Values{}
 	query.Set("skuId", strconv.Itoa(skuID))
 	query.Set("showId", showID)
 	query.Set("uguid", uguID)
 	query.Set("nn_userID", userID)
 	query.Set("app", "1")
-	req.URL.RawQuery = query.Encode()
-	req.Header.Add("User-Agent", userAgentTwo)
-	do, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer do.Body.Close()
-	if do.StatusCode != http.StatusOK {
-		return "", errors.New(do.Status)
-	}
 	var obj PurchasedManResp
-	err = json.NewDecoder(do.Body).Decode(&obj)
-	if err != nil {
+	if err := apiGet(ctx, "bigriver/vidPlayer.aspx", query, userAgentTwo, &obj); err != nil {
 		return "", err
 	}
 	return obj.FileURL, nil
 }
 
-func getStreamMeta(trackId, skuId, format int, streamParams *StreamParams) (string, error) {
-	req, err := http.NewRequest(http.MethodGet, streamApiBase+"bigriver/subPlayer.aspx", nil)
-	if err != nil {
-		return "", err
-	}
+func getStreamMeta(ctx context.Context, trackId, skuId, format int, streamParams *StreamParams) (string, error) {
 	query := url.Values{}
 	if format == 0 {
 		query.Set("skuId", strconv.Itoa(skuId))
@@ -581,63 +631,55 @@ func getStreamMeta(trackId, skuId, format int, streamParams *StreamParams) (stri
 	query.Set("nn_userID", streamParams.UserID)
 	query.Set("startDateStamp", streamParams.StartStamp)
 	query.Set("endDateStamp", streamParams.EndStamp)
-	req.URL.RawQuery = query.Encode()
-	req.Header.Add("User-Agent", userAgentTwo)
-	do, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer do.Body.Close()
-	if do.StatusCode != http.StatusOK {
-		return "", errors.New(do.Status)
-	}
 	var obj StreamMeta
-	err = json.NewDecoder(do.Body).Decode(&obj)
-	if err != nil {
+	if err := apiGet(ctx, "bigriver/subPlayer.aspx", query, userAgentTwo, &obj); err != nil {
 		return "", err
 	}
 	return obj.StreamLink, nil
 }
 
 func queryQuality(streamUrl string) *Quality {
-	for k, v := range qualityMap {
-		if strings.Contains(streamUrl, k) {
-			v.URL = streamUrl
-			return &v
+	for _, sq := range streamQualities {
+		if strings.Contains(streamUrl, sq.marker) {
+			q := sq.quality
+			q.URL = streamUrl
+			return &q
 		}
 	}
 	return nil
 }
 
-func downloadTrack(trackPath, _url string) error {
-	f, err := os.OpenFile(trackPath, os.O_CREATE|os.O_WRONLY, 0755)
+// fetch streams the body of a track URL into w, printing progress as it goes.
+func fetch(ctx context.Context, w io.Writer, trackUrl string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, trackUrl, nil)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	req, err := http.NewRequest(http.MethodGet, _url, nil)
+	req.Header.Set("Referer", playerUrl)
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Range", "bytes=0-")
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
-	req.Header.Add("Referer", playerUrl)
-	req.Header.Add("User-Agent", userAgent)
-	req.Header.Add("Range", "bytes=0-")
-	do, err := client.Do(req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return errors.New(resp.Status)
+	}
+	_, err = io.Copy(w, io.TeeReader(resp.Body, newWriteCounter(resp.ContentLength)))
+	fmt.Println()
+	return err
+}
+
+func downloadTrack(ctx context.Context, trackPath, trackUrl string) error {
+	f, err := os.OpenFile(trackPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
-	defer do.Body.Close()
-	if do.StatusCode != http.StatusOK && do.StatusCode != http.StatusPartialContent {
-		return errors.New(do.Status)
+	err = fetch(ctx, f, trackUrl)
+	if cerr := f.Close(); err == nil {
+		err = cerr
 	}
-	totalBytes := do.ContentLength
-	counter := &WriteCounter{
-		Total:     totalBytes,
-		TotalStr:  humanize.Bytes(uint64(totalBytes)),
-		StartTime: time.Now().UnixMilli(),
-	}
-	_, err = io.Copy(f, io.TeeReader(do.Body, counter))
-	fmt.Println("")
 	return err
 }
 
@@ -650,33 +692,39 @@ func getTrackQual(quals []*Quality, wantFmt int) *Quality {
 	return nil
 }
 
+// pickQuality returns the quality matching wantFmt, following trackFallback when
+// it isn't available, along with the format that was chosen.
+func pickQuality(quals []*Quality, wantFmt int) (*Quality, int) {
+	for f := wantFmt; f != 0; f = trackFallback[f] {
+		if q := getTrackQual(quals, f); q != nil {
+			return q, f
+		}
+	}
+	return nil, 0
+}
+
 func extractBitrate(manUrl string) string {
-	regex := regexp.MustCompile(bitrateRegex)
-	match := regex.FindStringSubmatch(manUrl)
-	if match != nil {
+	if match := bitrateRegex.FindStringSubmatch(manUrl); match != nil {
 		return match[1]
 	}
 	return ""
 }
 
-func parseHlsMaster(qual *Quality) error {
-	req, err := client.Get(qual.URL)
-	if err != nil {
-		return err
-	}
-	defer req.Body.Close()
-	if req.StatusCode != http.StatusOK {
-		return errors.New(req.Status)
-	}
-
-	playlist, _, err := m3u8.DecodeFrom(req.Body, true)
-	if err != nil {
-		return err
-	}
-	master := playlist.(*m3u8.MasterPlaylist)
-	sort.Slice(master.Variants, func(x, y int) bool {
-		return master.Variants[x].Bandwidth > master.Variants[y].Bandwidth
+func sortByBandwidth(variants []*m3u8.Variant) {
+	slices.SortFunc(variants, func(a, b *m3u8.Variant) int {
+		return cmp.Compare(b.Bandwidth, a.Bandwidth)
 	})
+}
+
+func parseHlsMaster(ctx context.Context, qual *Quality) error {
+	master, err := getPlaylist[*m3u8.MasterPlaylist](ctx, qual.URL)
+	if err != nil {
+		return err
+	}
+	if len(master.Variants) == 0 {
+		return errors.New("master manifest has no variants")
+	}
+	sortByBandwidth(master.Variants)
 	variantUri := master.Variants[0].URI
 	bitrate := extractBitrate(variantUri)
 	if bitrate == "" {
@@ -690,138 +738,122 @@ func parseHlsMaster(qual *Quality) error {
 	qual.URL = manBase + variantUri + q
 	return nil
 }
-func getKey(keyUrl string) ([]byte, error) {
-	req, err := client.Get(keyUrl)
+
+func getKey(ctx context.Context, keyUrl string) ([]byte, error) {
+	resp, err := httpGet(ctx, keyUrl)
 	if err != nil {
 		return nil, err
 	}
-	defer req.Body.Close()
-	if req.StatusCode != http.StatusOK {
-		return nil, errors.New(req.Status)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, errors.New(resp.Status)
 	}
-	buf := make([]byte, 16)
-	_, err = io.ReadFull(req.Body, buf)
-	if err != nil {
+	buf := make([]byte, aes.BlockSize)
+	if _, err := io.ReadFull(resp.Body, buf); err != nil {
 		return nil, err
 	}
 	return buf, nil
 }
 
-// func decryptTrack(key, iv []byte, inPath, outPath string) error {
-// 	var stream cipher.Stream
-// 	fmt.Println("Decrypting...")
-// 	in_f, err := os.Open(inPath)
-// 	if err != nil {
-// 		return err
-// 	}
-
-// 	block, err := aes.NewCipher([]byte(key))
-// 	if err != nil {
-// 		in_f.Close()
-// 		return err
-// 	}
-// 	stream = cipher.NewCTR(block, []byte(iv))
-// 	reader := &cipher.StreamReader{S: stream, R: in_f}
-// 	out_f, err := os.Create(outPath)
-// 	if err != nil {
-// 		in_f.Close()
-// 		return err
-// 	}
-// 	defer out_f.Close()
-// 	_, err = io.Copy(out_f, reader)
-// 	if err != nil {
-// 		in_f.Close()
-// 		return err
-// 	}
-// 	in_f.Close()
-// 	err = os.Remove(inPath)
-// 	if err != nil {
-// 		fmt.Println("Failed to delete encrypted track.")
-// 	}
-// 	return nil
-// }
-
-func pkcs5Trimming(data []byte) []byte {
-	padding := data[len(data)-1]
-	return data[:len(data)-int(padding)]
-}
-
-func decryptTrack(key, iv []byte) ([]byte, error) {
-	encData, err := os.ReadFile("temp_enc.ts")
+// parseIV decodes an EXT-X-KEY IV. When the tag has none, HLS uses the segment's
+// media sequence number as a big-endian 128-bit IV.
+func parseIV(ivStr string, seqNo uint64) ([]byte, error) {
+	if ivStr == "" {
+		iv := make([]byte, aes.BlockSize)
+		binary.BigEndian.PutUint64(iv[8:], seqNo)
+		return iv, nil
+	}
+	ivHex := strings.TrimPrefix(strings.TrimPrefix(ivStr, "0x"), "0X")
+	iv, err := hex.DecodeString(ivHex)
 	if err != nil {
 		return nil, err
 	}
+	if len(iv) != aes.BlockSize {
+		return nil, fmt.Errorf("IV is %d bytes, want %d", len(iv), aes.BlockSize)
+	}
+	return iv, nil
+}
+
+// pkcs7Unpad strips PKCS#7 padding, returning data unchanged if the padding isn't valid.
+func pkcs7Unpad(data []byte) []byte {
+	if len(data) == 0 {
+		return data
+	}
+	pad := int(data[len(data)-1])
+	if pad == 0 || pad > aes.BlockSize || pad > len(data) {
+		return data
+	}
+	for _, b := range data[len(data)-pad:] {
+		if int(b) != pad {
+			return data
+		}
+	}
+	return data[:len(data)-pad]
+}
+
+func decryptTrack(key, iv, encData []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
-	ecb := cipher.NewCBCDecrypter(block, iv)
-	decrypted := make([]byte, len(encData))
+	if len(encData)%aes.BlockSize != 0 {
+		return nil, errors.New("encrypted segment isn't a multiple of the AES block size")
+	}
 	fmt.Println("Decrypting...")
-	ecb.CryptBlocks(decrypted, encData)
-	return decrypted, nil
+	decrypted := make([]byte, len(encData))
+	cipher.NewCBCDecrypter(block, iv).CryptBlocks(decrypted, encData)
+	return pkcs7Unpad(decrypted), nil
 }
 
-func tsToAac(decData []byte, outPath, ffmpegNameStr string) error {
+func runFfmpeg(cmd *exec.Cmd) error {
 	var errBuffer bytes.Buffer
-	cmd := exec.Command(ffmpegNameStr, "-i", "pipe:", "-c:a", "copy", outPath)
-	cmd.Stdin = bytes.NewReader(decData)
 	cmd.Stderr = &errBuffer
-	err := cmd.Run()
-	if err != nil {
-		errString := fmt.Sprintf("%s\n%s", err, errBuffer.String())
-		return errors.New(errString)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%w\n%s", err, errBuffer.String())
 	}
 	return nil
 }
 
+func tsToAac(ctx context.Context, decData []byte, outPath, ffmpegNameStr string) error {
+	cmd := exec.CommandContext(ctx, ffmpegNameStr, "-hide_banner", "-y", "-i", "pipe:", "-c:a", "copy", outPath)
+	cmd.Stdin = bytes.NewReader(decData)
+	return runFfmpeg(cmd)
+}
 
-func hlsOnly(trackPath, manUrl, ffmpegNameStr string) error {
-	req, err := client.Get(manUrl)
+func hlsOnly(ctx context.Context, trackPath, manUrl, ffmpegNameStr string) error {
+	media, err := getPlaylist[*m3u8.MediaPlaylist](ctx, manUrl)
 	if err != nil {
 		return err
 	}
-	defer req.Body.Close()
-	if req.StatusCode != http.StatusOK {
-		return errors.New(req.Status)
+	segs := media.GetAllSegments()
+	if len(segs) == 0 {
+		return errors.New("media manifest has no segments")
 	}
-	playlist, _, err := m3u8.DecodeFrom(req.Body, true)
-	if err != nil {
-		return err
+	if len(media.Keys) == 0 {
+		return errors.New("no key found in manifest")
 	}
-	media := playlist.(*m3u8.MediaPlaylist)
-
 	manBase, q, err := getManifestBase(manUrl)
 	if err != nil {
 		return err
 	}
-	tsUrl := manBase + media.Segments[0].URI + q
-
-	key := media.Key
-	keyBytes, err := getKey(manBase + key.URI)
+	key := media.Keys[0]
+	keyBytes, err := getKey(ctx, manBase+key.URI)
+	if err != nil {
+		return fmt.Errorf("get key: %w", err)
+	}
+	iv, err := parseIV(key.IV, media.SeqNo)
 	if err != nil {
 		return err
 	}
-
-	iv, err := hex.DecodeString(key.IV[2:])
+	var encData bytes.Buffer
+	if err := fetch(ctx, &encData, manBase+segs[0].URI+q); err != nil {
+		return err
+	}
+	decData, err := decryptTrack(keyBytes, iv, encData.Bytes())
 	if err != nil {
 		return err
 	}
-
-	err = downloadTrack("temp_enc.ts", tsUrl)
-	if err != nil {
-		return err
-	}
-	decData, err := decryptTrack(keyBytes, iv)
-	if err != nil {
-		return err
-	}
-	err = os.Remove("temp_enc.ts")
-	if err != nil {
-		return err
-	}
-	err = tsToAac(decData, trackPath, ffmpegNameStr)
-	return err
+	return tsToAac(ctx, decData, trackPath, ffmpegNameStr)
 }
 
 func checkIfHlsOnly(quals []*Quality) bool {
@@ -833,20 +865,14 @@ func checkIfHlsOnly(quals []*Quality) bool {
 	return true
 }
 
-func processTrack(folPath string, trackNum, trackTotal int, cfg *Config, track *Track, streamParams *StreamParams) error {
-	origWantFmt := cfg.Format
-	wantFmt := origWantFmt
-	var (
-		quals      []*Quality
-		chosenQual *Quality
-	)
+func processTrack(ctx context.Context, folPath string, trackNum, trackTotal int, cfg *Config, track *Track, streamParams *StreamParams) error {
+	var quals []*Quality
 	// Call the stream meta endpoint four times to get all avail formats since the formats can shift.
 	// This will ensure the right format's always chosen.
 	for _, i := range [4]int{1, 4, 7, 10} {
-		streamUrl, err := getStreamMeta(track.TrackID, 0, i, streamParams)
+		streamUrl, err := getStreamMeta(ctx, track.TrackID, 0, i, streamParams)
 		if err != nil {
-			fmt.Println("failed to get track stream metadata")
-			return err
+			return fmt.Errorf("get track stream metadata: %w", err)
 		} else if streamUrl == "" {
 			return errors.New("the api didn't return a track stream URL")
 		}
@@ -854,53 +880,39 @@ func processTrack(folPath string, trackNum, trackTotal int, cfg *Config, track *
 		if quality == nil {
 			fmt.Println("The API returned an unsupported format, URL:", streamUrl)
 			continue
-			//return errors.New("The API returned an unsupported format.")
 		}
 		quals = append(quals, quality)
-		// if quality.Format == 6 {
-		// 	isHlsOnly = true
-		// 	break
-		// }
 	}
 
 	if len(quals) == 0 {
 		return errors.New("the api didn't return any formats")
 	}
 
+	var chosenQual *Quality
 	isHlsOnly := checkIfHlsOnly(quals)
-
 	if isHlsOnly {
 		fmt.Println("HLS-only track. Only AAC is available, tags currently unsupported.")
 		chosenQual = quals[0]
-		err := parseHlsMaster(chosenQual)
-		if err != nil {
-			return err
+		if err := parseHlsMaster(ctx, chosenQual); err != nil {
+			return fmt.Errorf("parse HLS master manifest: %w", err)
 		}
 	} else {
-		for {
-			chosenQual = getTrackQual(quals, wantFmt)
-			if chosenQual != nil {
-				break
-			} else {
-				// Fallback quality.
-				wantFmt = trackFallback[wantFmt]
-			}
-		}
+		var chosenFmt int
+		chosenQual, chosenFmt = pickQuality(quals, cfg.Format)
 		if chosenQual == nil {
 			return errors.New("no track format was chosen")
 		}
-		if wantFmt != origWantFmt && origWantFmt != 4 {
+		if chosenFmt != cfg.Format && cfg.Format != 4 {
 			fmt.Println("Unavailable in your chosen format.")
 		}
 	}
-	trackFname := fmt.Sprintf(
-		"%02d. %s%s", trackNum, sanitise(track.SongTitle), chosenQual.Extension,
-	)
+	// Leave room under the usual 255-byte filename limit for the prefix and extensions.
+	title, _ := truncate(sanitise(track.SongTitle), 200)
+	trackFname := fmt.Sprintf("%02d. %s%s", trackNum, title, chosenQual.Extension)
 	trackPath := filepath.Join(folPath, trackFname)
 	exists, err := fileExists(trackPath)
 	if err != nil {
-		fmt.Println("Failed to check if track already exists locally.")
-		return err
+		return fmt.Errorf("check if track already exists locally: %w", err)
 	}
 	if exists {
 		fmt.Println("Track already exists locally.")
@@ -910,19 +922,42 @@ func processTrack(folPath string, trackNum, trackTotal int, cfg *Config, track *
 		"Downloading track %d of %d: %s - %s\n", trackNum, trackTotal, track.SongTitle,
 		chosenQual.Specs,
 	)
+	// Write under a temporary name so an interrupted download is never mistaken
+	// for a finished track on the next run.
+	tmpPath := partPath(trackPath)
 	if isHlsOnly {
-		err = hlsOnly(trackPath, chosenQual.URL, cfg.FfmpegNameStr)
+		err = hlsOnly(ctx, tmpPath, chosenQual.URL, cfg.FfmpegNameStr)
 	} else {
-		err = downloadTrack(trackPath, chosenQual.URL)
+		err = downloadTrack(ctx, tmpPath, chosenQual.URL)
 	}
 	if err != nil {
-		fmt.Println("Failed to download track.")
-		return err
+		os.Remove(tmpPath)
+		return fmt.Errorf("download track: %w", err)
+	}
+	return os.Rename(tmpPath, trackPath)
+}
+
+// downloadTracks downloads each track into folPath, reporting failures as it goes.
+// It stops early if ctx is cancelled and returns an error if any track failed.
+func downloadTracks(ctx context.Context, folPath string, tracks []*Track, cfg *Config, streamParams *StreamParams) error {
+	var failed int
+	for i, track := range tracks {
+		err := processTrack(ctx, folPath, i+1, len(tracks), cfg, track, streamParams)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
+			printErr("Track failed.", err)
+			failed++
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d of %d tracks failed", failed, len(tracks))
 	}
 	return nil
 }
 
-func album(albumID string, cfg *Config, streamParams *StreamParams, artResp *AlbArtResp) error {
+func album(ctx context.Context, albumID string, cfg *Config, streamParams *StreamParams, artResp *AlbArtResp) error {
 	var (
 		meta   *AlbArtResp
 		tracks []Track
@@ -931,12 +966,11 @@ func album(albumID string, cfg *Config, streamParams *StreamParams, artResp *Alb
 		meta = artResp
 		tracks = meta.Songs
 	} else {
-		_meta, err := getAlbumMeta(albumID)
+		m, err := getAlbumMeta(ctx, albumID)
 		if err != nil {
-			fmt.Println("Failed to get metadata.")
-			return err
+			return fmt.Errorf("get metadata: %w", err)
 		}
-		meta = _meta.Response
+		meta = m.Response
 		tracks = meta.Tracks
 	}
 
@@ -949,105 +983,98 @@ func album(albumID string, cfg *Config, streamParams *StreamParams, artResp *Alb
 	}
 
 	if skuID != 0 {
-		if cfg.SkipVideos {
+		switch {
+		case cfg.SkipVideos && trackTotal < 1:
 			fmt.Println("Video-only album, skipped.")
 			return nil
-		}
-		if cfg.ForceVideo || trackTotal < 1 {
-			return video(albumID, "", cfg, streamParams, meta, false)
+		case !cfg.SkipVideos && (cfg.ForceVideo || trackTotal < 1):
+			return video(ctx, albumID, "", cfg, streamParams, meta, false)
 		}
 	}
 	albumFolder := meta.ArtistName + " - " + strings.TrimRight(meta.ContainerInfo, " ")
 	fmt.Println(albumFolder)
-	if len(albumFolder) > 120 {
-		albumFolder = albumFolder[:120]
+	if s, chopped := truncate(albumFolder, 120); chopped {
+		albumFolder = s
 		fmt.Println(
 			"Album folder name was chopped because it exceeds 120 characters.")
 	}
 	albumPath := filepath.Join(cfg.OutPath, sanitise(albumFolder))
-	err := makeDirs(albumPath)
-	if err != nil {
-		fmt.Println("Failed to make album folder.")
-		return err
+	if err := makeDirs(albumPath); err != nil {
+		return fmt.Errorf("make album folder: %w", err)
 	}
-	for trackNum, track := range tracks {
-		trackNum++
-		err := processTrack(
-			albumPath, trackNum, trackTotal, cfg, &track, streamParams)
-		if err != nil {
-			handleErr("Track failed.", err, false)
-		}
+	trackPtrs := make([]*Track, len(tracks))
+	for i := range tracks {
+		trackPtrs[i] = &tracks[i]
 	}
-	return nil
+	return downloadTracks(ctx, albumPath, trackPtrs, cfg, streamParams)
 }
 
 func getAlbumTotal(meta []*ArtistMeta) int {
 	var total int
-	for _, _meta := range meta {
-		total += len(_meta.Response.Containers)
+	for _, m := range meta {
+		total += len(m.Response.Containers)
 	}
 	return total
 }
 
-func artist(artistId string, cfg *Config, streamParams *StreamParams) error {
-	meta, err := getArtistMeta(artistId)
+func artist(ctx context.Context, artistId string, cfg *Config, streamParams *StreamParams) error {
+	meta, err := getArtistMeta(ctx, artistId)
 	if err != nil {
-		fmt.Println("Failed to get artist metadata.")
-		return err
+		return fmt.Errorf("get artist metadata: %w", err)
 	}
 	if len(meta) == 0 {
-		return errors.New(
-			"The API didn't return any artist metadata.")
+		return errors.New("the api didn't return any artist metadata")
 	}
 	fmt.Println(meta[0].Response.Containers[0].ArtistName)
 	albumTotal := getAlbumTotal(meta)
-	for _, _meta := range meta {
-		for albumNum, container := range _meta.Response.Containers {
-			fmt.Printf("Item %d of %d:\n", albumNum+1, albumTotal)
+	albumNum, failed := 0, 0
+	for _, m := range meta {
+		for _, container := range m.Response.Containers {
+			albumNum++
+			fmt.Printf("Item %d of %d:\n", albumNum, albumTotal)
 			if cfg.SkipVideos {
-				err = album("", cfg, streamParams, container)
+				err = album(ctx, "", cfg, streamParams, container)
 			} else {
 				// Can't re-use this metadata as it doesn't have any product info for videos.
-				err = album(strconv.Itoa(container.ContainerID), cfg, streamParams, nil)
+				err = album(ctx, strconv.Itoa(container.ContainerID), cfg, streamParams, nil)
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
 			if err != nil {
-				handleErr("Item failed.", err, false)
+				printErr("Item failed.", err)
+				failed++
 			}
 		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d of %d items failed", failed, albumTotal)
 	}
 	return nil
 }
 
-func playlist(plistId, legacyToken string, cfg *Config, streamParams *StreamParams, cat bool) error {
-	_meta, err := getPlistMeta(plistId, cfg.Email, legacyToken, cat)
+func playlist(ctx context.Context, plistId, legacyToken string, cfg *Config, streamParams *StreamParams, cat bool) error {
+	m, err := getPlistMeta(ctx, plistId, cfg.Email, legacyToken, cat)
 	if err != nil {
-		fmt.Println("Failed to get playlist metadata.")
-		return err
+		return fmt.Errorf("get playlist metadata: %w", err)
 	}
-	meta := _meta.Response
+	meta := m.Response
 	plistName := meta.PlayListName
 	fmt.Println(plistName)
-	if len(plistName) > 120 {
-		plistName = plistName[:120]
+	if s, chopped := truncate(plistName, 120); chopped {
+		plistName = s
 		fmt.Println(
 			"Playlist folder name was chopped because it exceeds 120 characters.")
 	}
 	plistPath := filepath.Join(cfg.OutPath, sanitise(plistName))
-	err = makeDirs(plistPath)
-	if err != nil {
-		fmt.Println("Failed to make playlist folder.")
-		return err
+	if err := makeDirs(plistPath); err != nil {
+		return fmt.Errorf("make playlist folder: %w", err)
 	}
-	trackTotal := len(meta.Items)
-	for trackNum, track := range meta.Items {
-		trackNum++
-		err := processTrack(
-			plistPath, trackNum, trackTotal, cfg, &track.Track, streamParams)
-		if err != nil {
-			handleErr("Track failed.", err, false)
-		}
+	tracks := make([]*Track, len(meta.Items))
+	for i := range meta.Items {
+		tracks[i] = &meta.Items[i].Track
 	}
-	return nil
+	return downloadTracks(ctx, plistPath, tracks, cfg, streamParams)
 }
 
 func getVideoSku(products []Product) int {
@@ -1081,52 +1108,36 @@ func getVidVariant(variants []*m3u8.Variant, wantRes string) *m3u8.Variant {
 func formatRes(res string) string {
 	if res == "2160" {
 		return "4K"
-	} else {
-		return res + "p"
 	}
+	return res + "p"
 }
 
-func chooseVariant(manifestUrl, wantRes string) (*m3u8.Variant, string, error) {
-	origWantRes := wantRes
-	var wantVariant *m3u8.Variant
-	req, err := client.Get(manifestUrl)
+func chooseVariant(ctx context.Context, manifestUrl, wantRes string) (*m3u8.Variant, string, error) {
+	master, err := getPlaylist[*m3u8.MasterPlaylist](ctx, manifestUrl)
 	if err != nil {
 		return nil, "", err
 	}
-	defer req.Body.Close()
-	if req.StatusCode != http.StatusOK {
-		return nil, "", errors.New(req.Status)
+	if len(master.Variants) == 0 {
+		return nil, "", errors.New("master manifest has no variants")
 	}
-	playlist, _, err := m3u8.DecodeFrom(req.Body, true)
-	if err != nil {
-		return nil, "", err
-	}
-	master := playlist.(*m3u8.MasterPlaylist)
-	sort.Slice(master.Variants, func(x, y int) bool {
-		return master.Variants[x].Bandwidth > master.Variants[y].Bandwidth
-	})
+	sortByBandwidth(master.Variants)
 	if wantRes == "2160" {
 		variant := master.Variants[0]
-		varRes := strings.SplitN(variant.Resolution, "x", 2)[1]
-		varRes = formatRes(varRes)
-		return variant, varRes, nil
+		_, height, ok := strings.Cut(variant.Resolution, "x")
+		if !ok {
+			return nil, "", fmt.Errorf("unexpected variant resolution %q", variant.Resolution)
+		}
+		return variant, formatRes(height), nil
 	}
-	for {
-		wantVariant = getVidVariant(master.Variants, wantRes)
-		if wantVariant != nil {
-			break
-		} else {
-			wantRes = resFallback[wantRes]
+	for res := wantRes; res != ""; res = resFallback[res] {
+		if variant := getVidVariant(master.Variants, res); variant != nil {
+			if res != wantRes {
+				fmt.Println("Unavailable in your chosen format.")
+			}
+			return variant, formatRes(res), nil
 		}
 	}
-	if wantVariant == nil {
-		return nil, "", errors.New("No variant was chosen.")
-	}
-	if wantRes != origWantRes {
-		fmt.Println("Unavailable in your chosen format.")
-	}
-	wantRes = formatRes(wantRes)
-	return wantVariant, wantRes, nil
+	return nil, "", errors.New("no variant was chosen")
 }
 
 func getManifestBase(manifestUrl string) (string, string, error) {
@@ -1140,32 +1151,44 @@ func getManifestBase(manifestUrl string) (string, string, error) {
 	return base, "?" + u.RawQuery, nil
 }
 
-func getSegUrls(manifestUrl, query string) ([]string, error) {
+// getPlaylist fetches an HLS manifest and checks that it's the expected kind.
+func getPlaylist[T m3u8.Playlist](ctx context.Context, manifestUrl string) (T, error) {
+	var zero T
+	resp, err := httpGet(ctx, manifestUrl)
+	if err != nil {
+		return zero, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return zero, errors.New(resp.Status)
+	}
+	p, _, err := m3u8.DecodeFrom(resp.Body, true)
+	if err != nil {
+		return zero, err
+	}
+	pl, ok := p.(T)
+	if !ok {
+		return zero, fmt.Errorf("unexpected playlist type %T", p)
+	}
+	return pl, nil
+}
+
+func getSegUrls(ctx context.Context, manifestUrl, query string) ([]string, error) {
+	media, err := getPlaylist[*m3u8.MediaPlaylist](ctx, manifestUrl)
+	if err != nil {
+		return nil, err
+	}
 	var segUrls []string
-	req, err := client.Get(manifestUrl)
-	if err != nil {
-		return nil, err
-	}
-	defer req.Body.Close()
-	if req.StatusCode != http.StatusOK {
-		return nil, errors.New(req.Status)
-	}
-	playlist, _, err := m3u8.DecodeFrom(req.Body, true)
-	if err != nil {
-		return nil, err
-	}
-	media := playlist.(*m3u8.MediaPlaylist)
-	for _, seg := range media.Segments {
-		if seg == nil {
-			break
-		}
+	for _, seg := range media.GetAllSegments() {
 		segUrls = append(segUrls, seg.URI+query)
 	}
 	return segUrls, nil
 }
 
-func downloadVideo(videoPath, _url string) error {
-	f, err := os.OpenFile(videoPath, os.O_CREATE|os.O_WRONLY, 0755)
+// downloadVideo downloads videoUrl to videoPath, resuming a partial download.
+// A partial file is kept on failure so the next run can pick up where it left off.
+func downloadVideo(ctx context.Context, videoPath, videoUrl string) error {
+	f, err := os.OpenFile(videoPath, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
@@ -1177,76 +1200,88 @@ func downloadVideo(videoPath, _url string) error {
 	}
 	startByte := stat.Size()
 
-	req, err := http.NewRequest(http.MethodGet, _url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, videoUrl, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Add("Range", fmt.Sprintf("bytes=%d-", startByte))
-	do, err := client.Do(req)
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startByte))
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
-	defer do.Body.Close()
-	if do.StatusCode != http.StatusOK && do.StatusCode != http.StatusPartialContent {
-		return errors.New(do.Status)
-	}
+	defer resp.Body.Close()
 
-	if startByte > 0 {
-		fmt.Printf("TS already exists locally, resuming from byte %d...\n", startByte)
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		if startByte > 0 {
+			fmt.Printf("TS already exists locally, resuming from byte %d...\n", startByte)
+		}
+	case http.StatusOK:
+		// The server ignored the range and is sending the whole file.
 		startByte = 0
+	case http.StatusRequestedRangeNotSatisfiable:
+		if startByte > 0 {
+			fmt.Println("TS already fully downloaded.")
+			return nil
+		}
+		return errors.New(resp.Status)
+	default:
+		return errors.New(resp.Status)
 	}
+	if err := f.Truncate(startByte); err != nil {
+		return err
+	}
+	if _, err := f.Seek(startByte, io.SeekStart); err != nil {
+		return err
+	}
+	_, err = io.Copy(f, io.TeeReader(resp.Body, newWriteCounter(resp.ContentLength)))
+	fmt.Println()
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
 
-	totalBytes := do.ContentLength
-	counter := &WriteCounter{
-		Total:     totalBytes,
-		TotalStr:  humanize.Bytes(uint64(totalBytes)),
-		StartTime: time.Now().UnixMilli(),
-		Downloaded: startByte,
+func copySegment(ctx context.Context, w io.Writer, segUrl string) error {
+	resp, err := httpGet(ctx, segUrl)
+	if err != nil {
+		return err
 	}
-	_, err = io.Copy(f, io.TeeReader(do.Body, counter))
-	fmt.Println("")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return errors.New(resp.Status)
+	}
+	_, err = io.Copy(w, resp.Body)
 	return err
 }
 
-func downloadLstream(videoPath, baseUrl string, segUrls []string) error {
-	f, err := os.OpenFile(videoPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0755)
+// downloadLstream concatenates the segments into videoPath. Segmented downloads
+// can't be resumed, so a partial file is removed on failure.
+func downloadLstream(ctx context.Context, videoPath, baseUrl string, segUrls []string) (err error) {
+	f, err := os.OpenFile(videoPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		f.Close()
+		if err != nil {
+			fmt.Println()
+			os.Remove(videoPath)
+		}
+	}()
 	segTotal := len(segUrls)
 	for segNum, segUrl := range segUrls {
-		segNum++
-		fmt.Printf("\rSegment %d of %d.", segNum, segTotal)
-		if err != nil {
-			return err
-		}
-		req, err := http.NewRequest(http.MethodGet, baseUrl+segUrl, nil)
-		if err != nil {
-			return err
-		}
-		do, err := client.Do(req)
-		if err != nil {
-			return err
-		}
-		if do.StatusCode != http.StatusOK {
-			do.Body.Close()
-			return errors.New(do.Status)
-		}
-		_, err = io.Copy(f, do.Body)
-		do.Body.Close()
-		if err != nil {
+		fmt.Printf("\rSegment %d of %d.", segNum+1, segTotal)
+		if err := copySegment(ctx, f, baseUrl+segUrl); err != nil {
 			return err
 		}
 	}
-	fmt.Println("")
-	return err
+	fmt.Println()
+	return f.Close()
 }
 
 func extractDuration(errStr string) string {
-	regex := regexp.MustCompile(durRegex)
-	match := regex.FindStringSubmatch(errStr)
-	if match != nil {
+	if match := durRegex.FindStringSubmatch(errStr); match != nil {
 		return match[1]
 	}
 	return ""
@@ -1261,195 +1296,105 @@ func parseDuration(dur string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	rounded := math.Round(d.Seconds())
-	return int(rounded), nil
+	return int(math.Round(d.Seconds())), nil
 }
 
 // Horrible, but best way without ffprobe.
 // My native Go duration calculation's too slow. Is there a way without having to iterate over all the packets?
-func getDuration(tsPath, ffmpegNameStr string) (int, error) {
+func getDuration(ctx context.Context, tsPath, ffmpegNameStr string) (int, error) {
 	var errBuffer bytes.Buffer
-	args := []string{"-hide_banner", "-i", tsPath}
-	cmd := exec.Command(ffmpegNameStr, args...)
+	cmd := exec.CommandContext(ctx, ffmpegNameStr, "-hide_banner", "-nostdin", "-i", tsPath)
 	cmd.Stderr = &errBuffer
-	// Return code's always 1 as we're not providing any output files.
+	// ffmpeg exits non-zero as we're not providing any output files, but it still
+	// prints the input's duration.
 	err := cmd.Run()
-	if err.Error() != "exit status 1" {
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+	var exitErr *exec.ExitError
+	if err != nil && !errors.As(err, &exitErr) {
 		return 0, err
 	}
 	errStr := errBuffer.String()
 	ok := strings.HasSuffix(
 		strings.TrimSpace(errStr), "At least one output file must be specified")
 	if !ok {
-		errString := fmt.Sprintf("%s\n%s", err, errStr)
-		return 0, errors.New(errString)
+		return 0, fmt.Errorf("%v\n%s", err, errStr)
 	}
 	dur := extractDuration(errStr)
 	if dur == "" {
-		return 0, errors.New("No regex match.")
+		return 0, errors.New("no duration found in ffmpeg output")
 	}
-	durSecs, err := parseDuration(dur)
-	if err != nil {
-		return 0, err
-	}
-	return durSecs, nil
+	return parseDuration(dur)
 }
 
-func getNextChapStart(chapters []interface{}, idx int) float64 {
+// ffmetaEscaper escapes the characters that are special in ffmpeg's metadata file format.
+var ffmetaEscaper = strings.NewReplacer(`\`, `\\`, "=", `\=`, ";", `\;`, "#", `\#`, "\n", "\\\n")
+
+func writeChaps(w io.Writer, chapters []VideoChapter, dur int) error {
+	var b strings.Builder
+	b.WriteString(";FFMETADATA1\n")
 	for i, chapter := range chapters {
-		if i == idx {
-			m := chapter.(map[string]interface{})
-			return m["chapterSeconds"].(float64)
-		}
-	}
-	return 0
-}
-
-
-func writeChapsFile(chapters []interface{}, dur int) error {
-	f, err := os.OpenFile(chapsFileFname, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0755)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	_, err = f.WriteString(";FFMETADATA1\n")
-	if err != nil {
-		return err
-	}
-	chaptersCount := len(chapters)
-
-	var nextChapStart float64
-
-	for i, chapter := range chapters {
-		i++
-		isLast := i == chaptersCount
-
-		// casting to struct won't work.
-		m := chapter.(map[string]interface{})
-		start := m["chapterSeconds"].(float64)
-
-		if !isLast {
-			nextChapStart = getNextChapStart(chapters, i)
-			if nextChapStart <= start {
+		end := dur
+		if i+1 < len(chapters) {
+			nextChapStart := chapters[i+1].ChapterSeconds
+			if nextChapStart <= chapter.ChapterSeconds {
 				continue
 			}
+			end = int(math.Round(nextChapStart) - 1)
 		}
-
-		_, err := f.WriteString("\n[CHAPTER]\n")
-		if err != nil {
-			return err
-		}
-		_, err = f.WriteString("TIMEBASE=1/1\n")
-		if err != nil {
-			return err
-		}
-
-		startLine := fmt.Sprintf("START=%d\n", int(math.Round(start)))
-		_, err = f.WriteString(startLine)
-		if err != nil {
-			return err
-		}
-		if isLast {
-			endLine := fmt.Sprintf("END=%d\n", dur)
-			_, err = f.WriteString(endLine)
-			if err != nil {
-				return err
-			}
-		} else {
-			endLine := fmt.Sprintf("END=%d\n", int(math.Round(nextChapStart)-1))
-			_, err = f.WriteString(endLine)
-			if err != nil {
-				return err
-			}
-		}
-		_, err = f.WriteString("TITLE=" + m["chaptername"].(string) + "\n")
-		if err != nil {
-			return err
-		}
+		fmt.Fprintf(&b, "\n[CHAPTER]\nTIMEBASE=1/1\nSTART=%d\nEND=%d\nTITLE=%s\n",
+			int(math.Round(chapter.ChapterSeconds)), end, ffmetaEscaper.Replace(chapter.ChapterName))
 	}
-	return nil
+	_, err := io.WriteString(w, b.String())
+	return err
+}
+
+func writeChapsFile(chapters []VideoChapter, dur int) (string, error) {
+	f, err := os.CreateTemp("", "nugs_dl_chapters_*.txt")
+	if err != nil {
+		return "", err
+	}
+	err = writeChaps(f, chapters, dur)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
 }
 
 // There are native MPEG demuxers and MP4 muxers for Go, but they're too slow.
-func tsToMp4(VidPathTs, vidPath, ffmpegNameStr string, chapAvail bool) error {
-	var (
-		errBuffer bytes.Buffer
-		args      []string
-	)
-	if chapAvail {
-		args = []string{
-			"-hide_banner", "-i", VidPathTs, "-f", "ffmetadata",
-			"-i", chapsFileFname, "-map_metadata", "1", "-c", "copy", vidPath,
-		}
-	} else {
-		args = []string{"-hide_banner", "-i", VidPathTs, "-c", "copy", vidPath}
+func tsToMp4(ctx context.Context, vidPathTs, vidPath, ffmpegNameStr, chapsPath string) error {
+	args := []string{"-hide_banner", "-nostdin", "-y", "-i", vidPathTs}
+	if chapsPath != "" {
+		args = append(args, "-f", "ffmetadata", "-i", chapsPath, "-map_metadata", "1")
 	}
-	cmd := exec.Command(ffmpegNameStr, args...)
-	cmd.Stderr = &errBuffer
-	err := cmd.Run()
-	if err != nil {
-		errString := fmt.Sprintf("%s\n%s", err, errBuffer.String())
-		return errors.New(errString)
-	}
-	return nil
+	args = append(args, "-c", "copy", vidPath)
+	return runFfmpeg(exec.CommandContext(ctx, ffmpegNameStr, args...))
 }
 
-func getLstreamContainer(containers []*AlbArtResp) *AlbArtResp {
-	for i := len(containers) - 1; i >= 0; i-- {
-		c := containers[i]
-		if c.AvailabilityTypeStr == "AVAILABLE" && c.ContainerTypeStr == "Show" {
-			return c
-		}
-	}
-	return nil
-}
-
-func parseLstreamMeta(_meta *ArtistMeta) *AlbumMeta {
-	meta := getLstreamContainer(_meta.Response.Containers)
-	parsed := &AlbumMeta{
-		Response: &AlbArtResp{
-			ArtistName:        meta.ArtistName,
-			ContainerInfo:     meta.ContainerInfo,
-			ContainerID:       meta.ContainerID,
-			VideoChapters:     meta.VideoChapters,
-			Products:          meta.Products,
-			ProductFormatList: meta.ProductFormatList,
-		},
-	}
-	return parsed
-}
-
-func video(videoID, uguID string, cfg *Config, streamParams *StreamParams, _meta *AlbArtResp, isLstream bool) error {
-	var (
-		chapsAvail bool
-		skuID int
-		manifestUrl string
-		meta *AlbArtResp
-		err error
-	)
-
-	if _meta != nil {
-		meta = _meta
-	} else {
-		m, err := getAlbumMeta(videoID)
+func video(ctx context.Context, videoID, uguID string, cfg *Config, streamParams *StreamParams, meta *AlbArtResp, isLstream bool) error {
+	if meta == nil {
+		m, err := getAlbumMeta(ctx, videoID)
 		if err != nil {
-			fmt.Println("Failed to get metadata.")
-			return err
+			return fmt.Errorf("get metadata: %w", err)
 		}
 		meta = m.Response
 	}
 
-	if !cfg.SkipChapters {
-		chapsAvail = !reflect.ValueOf(meta.VideoChapters).IsZero()
-	}
-	
+	chapsAvail := !cfg.SkipChapters && len(meta.VideoChapters) > 0
+
 	videoFname := meta.ArtistName + " - " + strings.TrimRight(meta.ContainerInfo, " ")
 	fmt.Println(videoFname)
-	if len(videoFname) > 110 {
-		videoFname = videoFname[:110]
+	if s, chopped := truncate(videoFname, 110); chopped {
+		videoFname = s
 		fmt.Println(
-			"Video filename was chopped because it exceeds 120 characters.")
+			"Video filename was chopped because it exceeds 110 characters.")
 	}
+	var skuID int
 	if isLstream {
 		skuID = getLstreamSku(meta.ProductFormatList)
 	} else {
@@ -1458,31 +1403,30 @@ func video(videoID, uguID string, cfg *Config, streamParams *StreamParams, _meta
 	if skuID == 0 {
 		return errors.New("no video available")
 	}
+	var (
+		manifestUrl string
+		err         error
+	)
 	if uguID == "" {
-		manifestUrl, err = getStreamMeta(
-			meta.ContainerID, skuID, 0, streamParams)
+		manifestUrl, err = getStreamMeta(ctx, meta.ContainerID, skuID, 0, streamParams)
 	} else {
-		manifestUrl, err = getPurchasedManUrl(skuID, videoID, streamParams.UserID, uguID)
+		manifestUrl, err = getPurchasedManUrl(ctx, skuID, videoID, streamParams.UserID, uguID)
 	}
-
 	if err != nil {
-		fmt.Println("Failed to get video file metadata.")
-		return err
+		return fmt.Errorf("get video file metadata: %w", err)
 	} else if manifestUrl == "" {
 		return errors.New("the api didn't return a video manifest url")
 	}
-	variant, retRes, err := chooseVariant(manifestUrl, cfg.WantRes)
+	variant, retRes, err := chooseVariant(ctx, manifestUrl, cfg.WantRes)
 	if err != nil {
-		fmt.Println("Failed to get video master manifest.")
-		return err
+		return fmt.Errorf("get video master manifest: %w", err)
 	}
 	vidPathNoExt := filepath.Join(cfg.OutPath, sanitise(videoFname+"_"+retRes))
-	VidPathTs := vidPathNoExt + ".ts"
+	vidPathTs := vidPathNoExt + ".ts"
 	vidPath := vidPathNoExt + ".mp4"
 	exists, err := fileExists(vidPath)
 	if err != nil {
-		fmt.Println("Failed to check if video already exists locally.")
-		return err
+		return fmt.Errorf("check if video already exists locally: %w", err)
 	}
 	if exists {
 		fmt.Println("Video already exists locally.")
@@ -1490,18 +1434,19 @@ func video(videoID, uguID string, cfg *Config, streamParams *StreamParams, _meta
 	}
 	manBaseUrl, query, err := getManifestBase(manifestUrl)
 	if err != nil {
-		fmt.Println("Failed to get video manifest base URL.")
-		return err
+		return fmt.Errorf("get video manifest base URL: %w", err)
 	}
 
-	segUrls, err := getSegUrls(manBaseUrl+variant.URI, query)
+	segUrls, err := getSegUrls(ctx, manBaseUrl+variant.URI, query)
 	if err != nil {
-		fmt.Println("Failed to get video segment URLs.")
-		return err
+		return fmt.Errorf("get video segment URLs: %w", err)
+	}
+	if len(segUrls) == 0 {
+		return errors.New("video manifest has no segments")
 	}
 
 	// Player album page videos aren't always only the first seg for the entire vid.
-	isLstream = segUrls[0] != segUrls[1]
+	isLstream = len(segUrls) > 1 && segUrls[0] != segUrls[1]
 
 	if !isLstream {
 		fmt.Printf("%.3f FPS, ", variant.FrameRate)
@@ -1509,176 +1454,185 @@ func video(videoID, uguID string, cfg *Config, streamParams *StreamParams, _meta
 	fmt.Printf("%d Kbps, %s (%s)\n",
 		variant.Bandwidth/1000, retRes, variant.Resolution)
 	if isLstream {
-		err = downloadLstream(VidPathTs, manBaseUrl, segUrls)
+		err = downloadLstream(ctx, vidPathTs, manBaseUrl, segUrls)
 	} else {
-		err = downloadVideo(VidPathTs, manBaseUrl+segUrls[0])
+		err = downloadVideo(ctx, vidPathTs, manBaseUrl+segUrls[0])
 	}
 	if err != nil {
-		fmt.Println("Failed to download video segments.")
-		return err
+		return fmt.Errorf("download video segments: %w", err)
 	}
+	var chapsPath string
 	if chapsAvail {
-		dur, err := getDuration(VidPathTs, cfg.FfmpegNameStr)
+		dur, err := getDuration(ctx, vidPathTs, cfg.FfmpegNameStr)
 		if err != nil {
-			fmt.Println("Failed to get TS duration.")
-			return err
+			return fmt.Errorf("get TS duration: %w", err)
 		}
-		err = writeChapsFile(meta.VideoChapters, dur)
+		chapsPath, err = writeChapsFile(meta.VideoChapters, dur)
 		if err != nil {
-			fmt.Println("Failed to write chapters file.")
-			return err
+			return fmt.Errorf("write chapters file: %w", err)
 		}
+		defer os.Remove(chapsPath)
 	}
 	fmt.Println("Putting into MP4 container...")
-	err = tsToMp4(VidPathTs, vidPath, cfg.FfmpegNameStr, chapsAvail)
-	if err != nil {
-		fmt.Println("Failed to put TS into MP4 container.")
+	tmpPath := partPath(vidPath)
+	if err := tsToMp4(ctx, vidPathTs, tmpPath, cfg.FfmpegNameStr, chapsPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("put TS into MP4 container: %w", err)
+	}
+	if err := os.Rename(tmpPath, vidPath); err != nil {
 		return err
 	}
-	if chapsAvail {
-		err = os.Remove(chapsFileFname)
-		if err != nil {
-			fmt.Println("Failed to delete chapters file.")
-		}
-	}
-	err = os.Remove(VidPathTs)
-	if err != nil {
+	if err := os.Remove(vidPathTs); err != nil {
 		fmt.Println("Failed to delete TS.")
 	}
 	return nil
 }
 
-func resolveCatPlistId(plistUrl string) (string, error) {
-	req, err := client.Get(plistUrl)
+func resolveCatPlistId(ctx context.Context, plistUrl string) (string, error) {
+	resp, err := httpGet(ctx, plistUrl)
 	if err != nil {
 		return "", err
 	}
-	req.Body.Close()
-	if req.StatusCode != http.StatusOK {
-		return "", errors.New(req.Status)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", errors.New(resp.Status)
 	}
-	location := req.Request.URL.String()
-	u, err := url.Parse(location)
-	if err != nil {
-		return "", err
-	}
-	q, err := url.ParseQuery(u.RawQuery)
-	if err != nil {
-		return "", err
-	}
-	resolvedId := q.Get("plGUID")
+	resolvedId := resp.Request.URL.Query().Get("plGUID")
 	if resolvedId == "" {
 		return "", errors.New("not a catalog playlist")
 	}
 	return resolvedId, nil
 }
 
-func catalogPlist(_plistId, legacyToken string, cfg *Config, streamParams *StreamParams) error {
-	plistId, err := resolveCatPlistId(_plistId)
+func catalogPlist(ctx context.Context, shortUrl, legacyToken string, cfg *Config, streamParams *StreamParams) error {
+	plistId, err := resolveCatPlistId(ctx, shortUrl)
 	if err != nil {
-		fmt.Println("Failed to resolve playlist ID.")
-		return err
+		return fmt.Errorf("resolve playlist ID: %w", err)
 	}
-	err = playlist(plistId, legacyToken, cfg, streamParams, true)
-	return err
+	return playlist(ctx, plistId, legacyToken, cfg, streamParams, true)
 }
 
-func paidLstream(query, uguID string, cfg *Config, streamParams *StreamParams) error {
-    q, err := url.ParseQuery(query)
+func paidLstream(ctx context.Context, query, uguID string, cfg *Config, streamParams *StreamParams) error {
+	q, err := url.ParseQuery(query)
 	if err != nil {
 		return err
 	}
-	showId := q["showID"][0]
+	showId := q.Get("showID")
 	if showId == "" {
 		return errors.New("url didn't contain a show id parameter")
 	}
-	err = video(showId, uguID, cfg, streamParams, nil, true)
-	return err
-}
-
-func init() {
-	fmt.Println(`
- _____                ____                _           _         
-|   | |_ _ ___ ___   |    \ ___ _ _ _ ___| |___ ___ _| |___ ___ 
-| | | | | | . |_ -|  |  |  | . | | | |   | | . | .'| . | -_|  _|
-|_|___|___|_  |___|  |____/|___|_____|_|_|_|___|__,|___|___|_|  
-	  |___|
-`)
+	return video(ctx, showId, uguID, cfg, streamParams, nil, true)
 }
 
 func main() {
-	var token string
+	os.Exit(run())
+}
+
+// run downloads every requested item and returns the process exit status: 0 on
+// success, 1 if anything failed, or 130 if interrupted.
+func run() int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		// Restore the default handling so a second Ctrl+C exits immediately.
+		stop()
+	}()
+	// fail reports a fatal error, or just the interruption if that's what caused it.
+	fail := func(errText string, err error) int {
+		if ctx.Err() != nil {
+			fmt.Fprintln(os.Stderr, "\nInterrupted.")
+			return exitInterrupted
+		}
+		printErr(errText, err)
+		return 1
+	}
+
+	fmt.Print(banner)
 	scriptDir, err := getScriptDir()
 	if err != nil {
-		panic(err)
+		return fail("Failed to get script directory.", err)
 	}
-	err = os.Chdir(scriptDir)
-	if err != nil {
-		panic(err)
+	if err := os.Chdir(scriptDir); err != nil {
+		return fail("Failed to change to script directory.", err)
 	}
 	cfg, err := parseCfg()
 	if err != nil {
-		handleErr("Failed to parse config/args.", err, true)
+		return fail("Failed to parse config/args.", err)
 	}
-	err = makeDirs(cfg.OutPath)
-	if err != nil {
-		handleErr("Failed to make output folder.", err, true)
+	if err := makeDirs(cfg.OutPath); err != nil {
+		return fail("Failed to make output folder.", err)
 	}
-	if cfg.Token == "" {
-		token, err = auth(cfg.Email, cfg.Password)
+	token := cfg.Token
+	if token == "" {
+		token, err = auth(ctx, cfg.Email, cfg.Password)
 		if err != nil {
-			handleErr("Failed to auth.", err, true)
+			return fail("Failed to auth.", err)
 		}
-	} else {
-		token = cfg.Token
 	}
-	userId, err := getUserInfo(token)
+	userId, err := getUserInfo(ctx, token)
 	if err != nil {
-		handleErr("Failed to get user info.", err, true)
+		return fail("Failed to get user info.", err)
 	}
-	subInfo, err := getSubInfo(token)
+	subInfo, err := getSubInfo(ctx, token)
 	if err != nil {
-		handleErr("Failed to get subcription info.", err, true)
+		return fail("Failed to get subscription info.", err)
 	}
 	legacyToken, uguID, err := extractLegToken(token)
 	if err != nil {
-		handleErr("Failed to extract legacy token.", err, true)
+		return fail("Failed to extract legacy token.", err)
 	}
 	planDesc, isPromo := getPlan(subInfo)
 	if !subInfo.IsContentAccessible {
 		planDesc = "no active subscription"
 	}
-	fmt.Println(
-		"Signed in successfully - " + planDesc + "\n",
-	)
+	fmt.Println("Signed in successfully - " + planDesc + "\n")
 	streamParams := parseStreamParams(userId, subInfo, isPromo)
-	albumTotal := len(cfg.Urls)
-	var itemErr error
-	for albumNum, _url := range cfg.Urls {
-		fmt.Printf("Item %d of %d:\n", albumNum+1, albumTotal)
-		itemId, mediaType := checkUrl(_url)
+	itemTotal := len(cfg.Urls)
+	failed := 0
+	for itemNum, itemUrl := range cfg.Urls {
+		if ctx.Err() != nil {
+			break
+		}
+		fmt.Printf("Item %d of %d:\n", itemNum+1, itemTotal)
+		itemId, mediaType := checkUrl(itemUrl)
 		if itemId == "" {
-			fmt.Println("Invalid URL:", _url)
+			fmt.Fprintln(os.Stderr, "Invalid URL:", itemUrl)
+			failed++
 			continue
 		}
+		var itemErr error
 		switch mediaType {
 		case 0:
-			itemErr = album(itemId, cfg, streamParams, nil)
+			itemErr = album(ctx, itemId, cfg, streamParams, nil)
 		case 1, 2:
-			itemErr = playlist(itemId, legacyToken, cfg, streamParams, false)
+			itemErr = playlist(ctx, itemId, legacyToken, cfg, streamParams, false)
 		case 3:
-			itemErr = catalogPlist(itemId, legacyToken, cfg, streamParams)
+			itemErr = catalogPlist(ctx, itemId, legacyToken, cfg, streamParams)
 		case 4, 10:
-			itemErr = video(itemId, "", cfg, streamParams, nil, false)
+			itemErr = video(ctx, itemId, "", cfg, streamParams, nil, false)
 		case 5:
-			itemErr = artist(itemId, cfg, streamParams)
+			itemErr = artist(ctx, itemId, cfg, streamParams)
 		case 6, 7, 8:
-			itemErr = video(itemId, "", cfg, streamParams, nil, true)
+			itemErr = video(ctx, itemId, "", cfg, streamParams, nil, true)
 		case 9:
-			itemErr = paidLstream(itemId, uguID, cfg, streamParams)
+			itemErr = paidLstream(ctx, itemId, uguID, cfg, streamParams)
+		}
+		if ctx.Err() != nil {
+			break
 		}
 		if itemErr != nil {
-			handleErr("Item failed.", itemErr, false)
+			printErr("Item failed.", itemErr)
+			failed++
 		}
 	}
+	if ctx.Err() != nil {
+		fmt.Fprintln(os.Stderr, "\nInterrupted.")
+		return exitInterrupted
+	}
+	if failed > 0 {
+		fmt.Fprintf(os.Stderr, "%d of %d items failed.\n", failed, itemTotal)
+		return 1
+	}
+	return 0
 }

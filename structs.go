@@ -25,6 +25,7 @@ type Config struct {
 	ForceVideo    bool     `json:"-"`
 	SkipVideos    bool     `json:"-"`
 	SkipChapters  bool     `json:"-"`
+	UseFfmpeg     bool     `json:"-"`
 }
 
 type Args struct {
@@ -35,6 +36,7 @@ type Args struct {
 	ForceVideo   bool     `arg:"--force-video" help:"Forces video when it co-exists with audio in release URLs."`
 	SkipVideos   bool     `arg:"--skip-videos" help:"Skips videos in artist URLs."`
 	SkipChapters bool     `arg:"--skip-chapters" help:"Skips chapters for videos."`
+	Ffmpeg       bool     `arg:"--ffmpeg" help:"Use FFmpeg instead of the built-in converter for videos and HLS-only tracks."`
 }
 
 type Auth struct {

@@ -287,6 +287,7 @@ func parseCfg() (*Config, error) {
 	cfg.ForceVideo = args.ForceVideo
 	cfg.SkipVideos = args.SkipVideos
 	cfg.SkipChapters = args.SkipChapters
+	cfg.UseFfmpeg = args.Ffmpeg
 	return cfg, nil
 }
 
@@ -821,7 +822,7 @@ func tsToAac(ctx context.Context, decData []byte, outPath, ffmpegNameStr string)
 	return runFfmpeg(cmd)
 }
 
-func hlsOnly(ctx context.Context, trackPath, manUrl, ffmpegNameStr string) error {
+func hlsOnly(ctx context.Context, trackPath, manUrl string, cfg *Config) error {
 	media, err := getPlaylist[*m3u8.MediaPlaylist](ctx, manUrl)
 	if err != nil {
 		return err
@@ -854,7 +855,10 @@ func hlsOnly(ctx context.Context, trackPath, manUrl, ffmpegNameStr string) error
 	if err != nil {
 		return err
 	}
-	return tsToAac(ctx, decData, trackPath, ffmpegNameStr)
+	if cfg.UseFfmpeg {
+		return tsToAac(ctx, decData, trackPath, cfg.FfmpegNameStr)
+	}
+	return remuxToMp4(ctx, bytes.NewReader(decData), trackPath, nil)
 }
 
 func checkIfHlsOnly(quals []*Quality) bool {
@@ -927,7 +931,7 @@ func processTrack(ctx context.Context, folPath string, trackNum, trackTotal int,
 	// for a finished track on the next run.
 	tmpPath := partPath(trackPath)
 	if isHlsOnly {
-		err = hlsOnly(ctx, tmpPath, chosenQual.URL, cfg.FfmpegNameStr)
+		err = hlsOnly(ctx, tmpPath, chosenQual.URL, cfg)
 	} else {
 		err = downloadTrack(ctx, tmpPath, chosenQual.URL)
 	}
@@ -1367,7 +1371,23 @@ func writeChapsFile(chapters []VideoChapter, dur int) (string, error) {
 	return f.Name(), nil
 }
 
-// There are native MPEG demuxers and MP4 muxers for Go, but they're too slow.
+// ffmpegTsToMp4 is the --ffmpeg alternative to remuxFile.
+func ffmpegTsToMp4(ctx context.Context, vidPathTs, vidPath, ffmpegNameStr string, chapters []VideoChapter) error {
+	var chapsPath string
+	if len(chapters) > 0 {
+		dur, err := getDuration(ctx, vidPathTs, ffmpegNameStr)
+		if err != nil {
+			return fmt.Errorf("get TS duration: %w", err)
+		}
+		chapsPath, err = writeChapsFile(chapters, dur)
+		if err != nil {
+			return fmt.Errorf("write chapters file: %w", err)
+		}
+		defer os.Remove(chapsPath)
+	}
+	return tsToMp4(ctx, vidPathTs, vidPath, ffmpegNameStr, chapsPath)
+}
+
 func tsToMp4(ctx context.Context, vidPathTs, vidPath, ffmpegNameStr, chapsPath string) error {
 	args := []string{"-hide_banner", "-nostdin", "-y", "-i", vidPathTs}
 	if chapsPath != "" {
@@ -1462,21 +1482,18 @@ func video(ctx context.Context, videoID, uguID string, cfg *Config, streamParams
 	if err != nil {
 		return fmt.Errorf("download video segments: %w", err)
 	}
-	var chapsPath string
+	var chapters []VideoChapter
 	if chapsAvail {
-		dur, err := getDuration(ctx, vidPathTs, cfg.FfmpegNameStr)
-		if err != nil {
-			return fmt.Errorf("get TS duration: %w", err)
-		}
-		chapsPath, err = writeChapsFile(meta.VideoChapters, dur)
-		if err != nil {
-			return fmt.Errorf("write chapters file: %w", err)
-		}
-		defer os.Remove(chapsPath)
+		chapters = meta.VideoChapters
 	}
 	fmt.Println("Putting into MP4 container...")
 	tmpPath := partPath(vidPath)
-	if err := tsToMp4(ctx, vidPathTs, tmpPath, cfg.FfmpegNameStr, chapsPath); err != nil {
+	if cfg.UseFfmpeg {
+		err = ffmpegTsToMp4(ctx, vidPathTs, tmpPath, cfg.FfmpegNameStr, chapters)
+	} else {
+		err = remuxFile(ctx, vidPathTs, tmpPath, chapters)
+	}
+	if err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("put TS into MP4 container: %w", err)
 	}

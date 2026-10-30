@@ -13,6 +13,8 @@ go build -o nugs_dl .
 go test ./...
 ```
 
+It's pure Go, so it cross-compiles to a single self-contained file for any platform, e.g. `GOOS=windows GOARCH=amd64 go build -o nugs_dl.exe .` or `GOOS=linux GOARCH=arm64 go build -o nugs_dl .`
+
 # Setup
 Put these files next to the binary.
 
@@ -33,13 +35,15 @@ Copy `config.example.json` to `config.json` and configure any options if needed.
 |Option|Info|
 | --- | --- |
 |format|Track download quality. 1 = 16-bit / 44.1 kHz ALAC, 2 = 16-bit / 44.1 kHz FLAC, 3 = 24-bit / 48 kHz MQA, 4 = 360 Reality Audio / best available, 5 = 150 Kbps AAC.
-|videoFormat|Video download format. 1 = 480p, 2 = 720p, 3 = 1080p, 4 = 1440p, 5 = 4K / best available. **FFmpeg needed, see below.**
+|videoFormat|Video download format. 1 = 480p, 2 = 720p, 3 = 1080p, 4 = 1440p, 5 = 4K / best available.
 |outPath|Where to download to. Path will be made if it doesn't already exist.
-|useFfmpegEnvVar|true = call FFmpeg from environment variable, false = call from script dir.
+|useFfmpegEnvVar|Only used with `--ffmpeg`. true = call FFmpeg from environment variable, false = call from script dir.
 
-**FFmpeg is needed for TS -> MP4 losslessly for videos & HLS-only tracks, see below.**  
+No other software is needed: videos and HLS-only tracks are converted to MP4/M4A by the built-in converter, losslessly and with chapters.
 
-# FFmpeg Setup
+# FFmpeg (optional)
+The `--ffmpeg` flag uses FFmpeg for those conversions instead, as older versions did. Use it if the built-in converter reports an unsupported codec.
+
 [Windows (gpl)](https://github.com/BtbN/FFmpeg-Builds/releases)    
 Linux: `sudo apt install ffmpeg`    
 Termux `pkg install ffmpeg`
@@ -105,6 +109,7 @@ Options:
   --force-video          Forces video when it co-exists with audio in release URLs.
   --skip-videos          Skips videos in artist URLs.
   --skip-chapters        Skips chapters for videos.
+  --ffmpeg               Use FFmpeg instead of the built-in converter for videos and HLS-only tracks.
   --help, -h             display this help and exit
   ```
  

@@ -205,10 +205,14 @@ func buildStream(t *testing.T, o streamOpts) ([]byte, testMedia) {
 	return s.buf.Bytes(), media
 }
 
-func remuxBytes(t *testing.T, ts []byte, name string, chapters []VideoChapter) (*mp4.File, []byte) {
+func remuxBytes(t *testing.T, ts []byte, name string, chapters []VideoChapter, tags ...*mediaTags) (*mp4.File, []byte) {
 	t.Helper()
 	out := filepath.Join(t.TempDir(), name)
-	if err := remuxToMp4(t.Context(), bytes.NewReader(ts), out, chapters); err != nil {
+	var tg *mediaTags
+	if len(tags) > 0 {
+		tg = tags[0]
+	}
+	if err := remuxToMp4(t.Context(), bytes.NewReader(ts), out, chapters, tg); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(out)
@@ -483,14 +487,14 @@ func TestRemuxChapters(t *testing.T) {
 func TestRemuxRejectsHEVC(t *testing.T) {
 	s := newTestStream(t, true, false, astits.StreamTypeH265Video)
 	s.writePES(testVideoPID, 0xe0, 1000, 1000, []byte{0, 0, 0, 1, 0x40, 0x01}, true)
-	err := remuxToMp4(t.Context(), bytes.NewReader(s.buf.Bytes()), filepath.Join(t.TempDir(), "out.mp4"), nil)
+	err := remuxToMp4(t.Context(), bytes.NewReader(s.buf.Bytes()), filepath.Join(t.TempDir(), "out.mp4"), nil, nil)
 	if !errors.Is(err, errUnsupportedCodec) {
 		t.Errorf("err = %v, want errUnsupportedCodec", err)
 	}
 }
 
 func TestRemuxEmptyStream(t *testing.T) {
-	err := remuxToMp4(t.Context(), bytes.NewReader(nil), filepath.Join(t.TempDir(), "out.mp4"), nil)
+	err := remuxToMp4(t.Context(), bytes.NewReader(nil), filepath.Join(t.TempDir(), "out.mp4"), nil, nil)
 	if err == nil {
 		t.Error("remuxing an empty stream succeeded")
 	}
@@ -500,7 +504,7 @@ func TestRemuxCancelled(t *testing.T) {
 	ts, _ := buildStream(t, streamOpts{video: true, frames: 30, videoStart: 1000})
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	err := remuxToMp4(ctx, bytes.NewReader(ts), filepath.Join(t.TempDir(), "out.mp4"), nil)
+	err := remuxToMp4(ctx, bytes.NewReader(ts), filepath.Join(t.TempDir(), "out.mp4"), nil, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want context.Canceled", err)
 	}
@@ -544,7 +548,7 @@ func TestHlsOnlyWithoutFfmpeg(t *testing.T) {
 	defer srv.Close()
 
 	out := filepath.Join(t.TempDir(), "01. Song.part.m4a")
-	if err := hlsOnly(t.Context(), out, srv.URL+"/hls/index.m3u8?token=x", &Config{}); err != nil {
+	if err := hlsOnly(t.Context(), out, srv.URL+"/hls/index.m3u8?token=x", &Config{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(out)

@@ -2,5 +2,6 @@
     "format": 4,
     "videoFormat": 5,
     "outPath": "Nugs downloads",
+    "folderFormat": "{artist}/{date} {title}",
     "useFfmpegEnvVar": false
 }

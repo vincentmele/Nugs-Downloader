@@ -14,4 +14,5 @@ require (
 require (
 	github.com/alexflint/go-scalar v1.2.0 // indirect
 	github.com/asticode/go-astikit v0.30.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
 )

@@ -139,7 +139,7 @@ func TestRemuxRealFileRoundTrip(t *testing.T) {
 	outPath := filepath.Join(outDir, "roundtrip.mp4")
 	chapters := []VideoChapter{{ChapterSeconds: 0, ChapterName: "Set 1"}, {ChapterSeconds: seconds / 2, ChapterName: "Second half"}}
 	start := time.Now()
-	if err := remuxFile(t.Context(), tsPath, outPath, chapters); err != nil {
+	if err := remuxFile(t.Context(), tsPath, outPath, chapters, nil); err != nil {
 		t.Fatal(err)
 	}
 	elapsed := time.Since(start)

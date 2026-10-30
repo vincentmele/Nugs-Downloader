@@ -689,10 +689,10 @@ func useFakeAPI(t *testing.T, handler http.HandlerFunc) {
 	t.Cleanup(func() { streamApiBase = orig })
 }
 
-func testTracks(n int) []*Track {
-	var tracks []*Track
+func testTracks(n int) []trackItem {
+	var tracks []trackItem
 	for i := range n {
-		tracks = append(tracks, &Track{TrackID: i + 1, SongTitle: "Song"})
+		tracks = append(tracks, trackItem{track: &Track{TrackID: i + 1, SongTitle: fmt.Sprintf("Song %d", i+1)}})
 	}
 	return tracks
 }

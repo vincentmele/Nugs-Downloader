@@ -90,19 +90,19 @@ type remuxer struct {
 }
 
 // remuxFile repackages the MPEG-TS file at inPath into an MP4 file at outPath.
-func remuxFile(ctx context.Context, inPath, outPath string, chapters []VideoChapter) error {
+func remuxFile(ctx context.Context, inPath, outPath string, chapters []VideoChapter, tags *mediaTags) error {
 	f, err := os.Open(inPath)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	return remuxToMp4(ctx, f, outPath, chapters)
+	return remuxToMp4(ctx, f, outPath, chapters, tags)
 }
 
 // remuxToMp4 repackages the H.264 video and AAC audio of the MPEG-TS stream r
-// into an MP4 file at outPath, adding chapters if given. An outPath ending in
-// .m4a gets an audio file brand.
-func remuxToMp4(ctx context.Context, r io.Reader, outPath string, chapters []VideoChapter) (err error) {
+// into an MP4 file at outPath, adding chapters and tags if given. An outPath
+// ending in .m4a gets an audio file brand.
+func remuxToMp4(ctx context.Context, r io.Reader, outPath string, chapters []VideoChapter, tags *mediaTags) (err error) {
 	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
@@ -119,7 +119,7 @@ func remuxToMp4(ctx context.Context, r io.Reader, outPath string, chapters []Vid
 	if err := rm.demux(ctx, r); err != nil {
 		return err
 	}
-	return rm.finish(chapters)
+	return rm.finish(chapters, tags, tags.coverFor(ctx))
 }
 
 func (rm *remuxer) write(p []byte) error {
@@ -389,7 +389,7 @@ func (t *remuxTrack) startTime90() int64 {
 	return t.minPTS * tsClockRate / int64(t.timescale)
 }
 
-func (rm *remuxer) finish(chapters []VideoChapter) error {
+func (rm *remuxer) finish(chapters []VideoChapter, tags *mediaTags, cover []byte) error {
 	var tracks []*remuxTrack
 	for _, t := range []*remuxTrack{rm.video, rm.audio} {
 		if t != nil && len(t.sizes) > 0 {
@@ -442,9 +442,14 @@ func (rm *remuxer) finish(chapters []VideoChapter) error {
 	}
 	mvhd.Duration = movieDur
 	mvhd.NextTrackID = uint32(len(moov.Traks) + 1)
-	if len(marks) > 0 {
+	if tags != nil || len(marks) > 0 {
 		udta := &mp4.UdtaBox{}
-		udta.AddChild(rawBox("chpl", chplPayload(marks)))
+		if tags != nil {
+			udta.AddChild(rawBox("meta", metaPayload(tags, cover)))
+		}
+		if len(marks) > 0 {
+			udta.AddChild(rawBox("chpl", chplPayload(marks)))
+		}
 		moov.AddChild(udta)
 	}
 

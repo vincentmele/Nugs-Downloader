@@ -12,3 +12,6 @@
 # Local settings and credentials (see config.example.json and .env.example)
 /config.json
 /.env
+
+# Release builds
+/dist/

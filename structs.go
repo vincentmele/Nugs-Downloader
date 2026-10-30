@@ -1,12 +1,17 @@
 package main
 
-import "time"
+import (
+	"io"
+	"time"
+)
 
 type WriteCounter struct {
 	Total      int64
 	TotalStr   string
 	Downloaded int64
 	StartTime  time.Time
+	lastPrint  time.Time
+	out        io.Writer
 }
 
 type Config struct {
@@ -17,6 +22,7 @@ type Config struct {
 	OutPath         string `json:"outPath"`
 	Token           string `json:"token"`
 	UseFfmpegEnvVar bool   `json:"useFfmpegEnvVar"`
+	FolderFormat    string `json:"folderFormat"`
 
 	// Derived from args and the fields above, never read from config.json.
 	Urls          []string `json:"-"`
@@ -37,6 +43,11 @@ type Args struct {
 	SkipVideos   bool     `arg:"--skip-videos" help:"Skips videos in artist URLs."`
 	SkipChapters bool     `arg:"--skip-chapters" help:"Skips chapters for videos."`
 	Ffmpeg       bool     `arg:"--ffmpeg" help:"Use FFmpeg instead of the built-in converter for videos and HLS-only tracks."`
+}
+
+// Version makes go-arg offer --version.
+func (Args) Version() string {
+	return "nugs_dl " + version
 }
 
 type Auth struct {

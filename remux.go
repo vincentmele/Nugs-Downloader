@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"time"
 
 	"github.com/Eyevinn/mp4ff/aac"
 	"github.com/Eyevinn/mp4ff/avc"
@@ -805,4 +806,109 @@ var textSampleEntryPayload = []byte{
 	0x00, 0x01, // entry count
 	0x00, 0x01, // font ID
 	0x00, // font name length
+}
+
+// tsPresentationSpan returns the time from the first to the last frame of an
+// MPEG-TS file, preferring its video stream. It reads only the start and end
+// of the file, so it's fast even for very large files.
+func tsPresentationSpan(path string) (time.Duration, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	const window = 8 << 20
+	read := func(off, n int64) ([]byte, error) {
+		buf := make([]byte, n)
+		_, err := f.ReadAt(buf, off)
+		return buf, err
+	}
+	size := fi.Size()
+	head, err := read(0, min(window, size))
+	if err != nil {
+		return 0, err
+	}
+	tail, err := read(max(0, size-window), min(window, size))
+	if err != nil {
+		return 0, err
+	}
+	first, last := scanPTS(head), scanPTS(tail)
+	var best *ptsRange
+	var bestLast *ptsRange
+	for pid, r := range first {
+		if l := last[pid]; l != nil && (best == nil || (r.video && !best.video)) {
+			best, bestLast = r, l
+		}
+	}
+	if best == nil {
+		return 0, errors.New("no timestamps found")
+	}
+	span := (bestLast.max - best.min) % tsWrap
+	if span < 0 {
+		span += tsWrap
+	}
+	return time.Duration(span) * time.Second / tsClockRate, nil
+}
+
+type ptsRange struct {
+	min, max int64
+	ref      int64 // first timestamp seen, for undoing wraparound
+	video    bool
+}
+
+// scanPTS collects the range of PES timestamps per PID in a chunk of MPEG-TS
+// packets, which may start mid-packet.
+func scanPTS(buf []byte) map[uint16]*ptsRange {
+	const pktSize = 188
+	ranges := map[uint16]*ptsRange{}
+	synced := func(o int) bool {
+		return o+2*pktSize < len(buf) && buf[o] == 0x47 && buf[o+pktSize] == 0x47 && buf[o+2*pktSize] == 0x47
+	}
+	o := 0
+	for o < len(buf) && !synced(o) {
+		o++
+	}
+	for ; o+pktSize <= len(buf); o += pktSize {
+		pkt := buf[o : o+pktSize]
+		if pkt[0] != 0x47 || pkt[1]&0x40 == 0 { // need a sync byte and a PES start
+			continue
+		}
+		pid := uint16(pkt[1]&0x1f)<<8 | uint16(pkt[2])
+		afc := pkt[3] >> 4 & 3
+		if afc&1 == 0 {
+			continue
+		}
+		p := pkt[4:]
+		if afc&2 != 0 {
+			if int(p[0])+1 > len(p) {
+				continue
+			}
+			p = p[1+int(p[0]):]
+		}
+		if len(p) < 14 || p[0] != 0 || p[1] != 0 || p[2] != 1 || p[7]&0x80 == 0 {
+			continue
+		}
+		sid := p[3]
+		video := sid >= 0xe0 && sid <= 0xef
+		if !video && (sid < 0xc0 || sid > 0xdf) {
+			continue
+		}
+		pts := int64(p[9]&0x0e)<<29 | int64(p[10])<<22 | int64(p[11]&0xfe)<<14 | int64(p[12])<<7 | int64(p[13]>>1)
+		r := ranges[pid]
+		if r == nil {
+			ranges[pid] = &ptsRange{min: pts, max: pts, ref: pts, video: video}
+			continue
+		}
+		if pts < r.ref-tsWrap/2 {
+			pts += tsWrap
+		} else if pts > r.ref+tsWrap/2 {
+			pts -= tsWrap
+		}
+		r.min, r.max = min(r.min, pts), max(r.max, pts)
+	}
+	return ranges
 }

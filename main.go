@@ -1178,20 +1178,49 @@ func getPlaylist[T m3u8.Playlist](ctx context.Context, manifestUrl string) (T, e
 	return pl, nil
 }
 
-func getSegUrls(ctx context.Context, manifestUrl, query string) ([]string, error) {
+// segmentList is a video's media playlist.
+type segmentList struct {
+	urls     []string
+	duration float64 // total length in seconds
+	target   float64 // longest segment in seconds
+}
+
+func getSegUrls(ctx context.Context, manifestUrl, query string) (*segmentList, error) {
 	media, err := getPlaylist[*m3u8.MediaPlaylist](ctx, manifestUrl)
 	if err != nil {
 		return nil, err
 	}
-	var segUrls []string
+	segs := &segmentList{target: float64(media.TargetDuration)}
 	for _, seg := range media.GetAllSegments() {
-		segUrls = append(segUrls, seg.URI+query)
+		segs.urls = append(segs.urls, seg.URI+query)
+		segs.duration += seg.Duration
 	}
-	return segUrls, nil
+	return segs, nil
 }
 
-// downloadVideo downloads videoUrl to videoPath, resuming a partial download.
-// A partial file is kept on failure so the next run can pick up where it left off.
+// parseContentRange parses "bytes first-last/total" or "bytes */total",
+// returning -1 for parts that are absent or unknown.
+func parseContentRange(header string) (first, total int64) {
+	first, total = -1, -1
+	spec, ok := strings.CutPrefix(header, "bytes ")
+	if !ok {
+		return first, total
+	}
+	rng, size, _ := strings.Cut(spec, "/")
+	if n, err := strconv.ParseInt(size, 10, 64); err == nil {
+		total = n
+	}
+	if from, _, ok := strings.Cut(rng, "-"); ok {
+		if n, err := strconv.ParseInt(from, 10, 64); err == nil {
+			first = n
+		}
+	}
+	return first, total
+}
+
+// downloadVideo downloads videoUrl to videoPath, resuming a partial download
+// and skipping the download entirely if the file is already complete. A
+// partial file is kept on failure so the next run can pick up where it left off.
 func downloadVideo(ctx context.Context, videoPath, videoUrl string) error {
 	f, err := os.OpenFile(videoPath, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -1218,18 +1247,38 @@ func downloadVideo(ctx context.Context, videoPath, videoUrl string) error {
 
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
+		if first, _ := parseContentRange(resp.Header.Get("Content-Range")); first >= 0 && first != startByte {
+			if first != 0 {
+				return fmt.Errorf("server sent bytes from %d, asked for %d", first, startByte)
+			}
+			startByte = 0
+		}
 		if startByte > 0 {
 			fmt.Printf("TS already exists locally, resuming from byte %d...\n", startByte)
 		}
 	case http.StatusOK:
 		// The server ignored the range and is sending the whole file.
-		startByte = 0
-	case http.StatusRequestedRangeNotSatisfiable:
-		if startByte > 0 {
+		if startByte > 0 && resp.ContentLength == startByte {
 			fmt.Println("TS already fully downloaded.")
 			return nil
 		}
-		return errors.New(resp.Status)
+		startByte = 0
+	case http.StatusRequestedRangeNotSatisfiable:
+		if startByte == 0 {
+			return errors.New(resp.Status)
+		}
+		if _, total := parseContentRange(resp.Header.Get("Content-Range")); total >= 0 && total != startByte {
+			// The local file is bigger than the remote one, so it isn't this video.
+			fmt.Println("TS on disk doesn't match the video, downloading it again...")
+			resp.Body.Close()
+			if err := f.Truncate(0); err != nil {
+				return err
+			}
+			f.Close()
+			return downloadVideo(ctx, videoPath, videoUrl)
+		}
+		fmt.Println("TS already fully downloaded.")
+		return nil
 	default:
 		return errors.New(resp.Status)
 	}
@@ -1247,23 +1296,85 @@ func downloadVideo(ctx context.Context, videoPath, videoUrl string) error {
 	return f.Close()
 }
 
-func copySegment(ctx context.Context, w io.Writer, segUrl string) error {
+func copySegment(ctx context.Context, w io.Writer, segUrl string) (int64, error) {
 	resp, err := httpGet(ctx, segUrl)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return errors.New(resp.Status)
+		return 0, errors.New(resp.Status)
 	}
-	_, err = io.Copy(w, resp.Body)
-	return err
+	return io.Copy(w, resp.Body)
 }
 
-// downloadLstream concatenates the segments into videoPath. Segmented downloads
-// can't be resumed, so a partial file is removed on failure.
-func downloadLstream(ctx context.Context, videoPath, baseUrl string, segUrls []string) (err error) {
-	f, err := os.OpenFile(videoPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+// lstreamProgress records how much of a segmented download is on disk, in a
+// file next to it, so an interrupted download can resume.
+type lstreamProgress struct {
+	FirstSegment string `json:"firstSegment"` // identifies the playlist
+	Segments     int    `json:"segments"`     // segments fully written
+	Bytes        int64  `json:"bytes"`        // file size after those segments
+}
+
+func progressPath(videoPath string) string {
+	return videoPath + ".progress"
+}
+
+// segmentKey identifies a segment URL without its query, which holds access
+// tokens that change between runs.
+func segmentKey(segUrl string) string {
+	key, _, _ := strings.Cut(segUrl, "?")
+	return key
+}
+
+func readProgress(path string) (lstreamProgress, bool) {
+	var p lstreamProgress
+	data, err := os.ReadFile(path)
+	if err != nil || json.Unmarshal(data, &p) != nil {
+		return p, false
+	}
+	return p, true
+}
+
+func writeProgress(path string, p lstreamProgress) error {
+	data, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+// downloadLstream concatenates the segments into videoPath. It resumes an
+// interrupted download and skips one that's already complete, including a
+// complete file from a version that didn't record progress.
+func downloadLstream(ctx context.Context, videoPath, baseUrl string, segs *segmentList) (err error) {
+	progPath := progressPath(videoPath)
+	first := segmentKey(segs.urls[0])
+	total := len(segs.urls)
+	var size int64
+	if fi, err := os.Stat(videoPath); err == nil {
+		size = fi.Size()
+	}
+	start, offset := 0, int64(0)
+	if p, ok := readProgress(progPath); ok {
+		if p.FirstSegment == first && p.Segments <= total && p.Bytes <= size {
+			start, offset = p.Segments, p.Bytes
+		}
+	} else if size > 0 && tsCoversPlaylist(videoPath, segs) {
+		start, offset = total, size
+		if err := writeProgress(progPath, lstreamProgress{first, total, size}); err != nil {
+			return err
+		}
+	}
+	if start == total {
+		fmt.Println("TS already fully downloaded.")
+		return nil
+	}
+	if start > 0 {
+		fmt.Printf("TS partly downloaded, resuming from segment %d of %d...\n", start+1, total)
+	}
+
+	f, err := os.OpenFile(videoPath, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
@@ -1271,18 +1382,37 @@ func downloadLstream(ctx context.Context, videoPath, baseUrl string, segUrls []s
 		f.Close()
 		if err != nil {
 			fmt.Println()
-			os.Remove(videoPath)
 		}
 	}()
-	segTotal := len(segUrls)
-	for segNum, segUrl := range segUrls {
-		fmt.Printf("\rSegment %d of %d.", segNum+1, segTotal)
-		if err := copySegment(ctx, f, baseUrl+segUrl); err != nil {
+	if err := f.Truncate(offset); err != nil {
+		return err
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
+	for i := start; i < total; i++ {
+		fmt.Printf("\rSegment %d of %d.", i+1, total)
+		n, err := copySegment(ctx, f, baseUrl+segs.urls[i])
+		offset += n
+		if err != nil {
+			return err
+		}
+		if err := writeProgress(progPath, lstreamProgress{first, i + 1, offset}); err != nil {
 			return err
 		}
 	}
 	fmt.Println()
 	return f.Close()
+}
+
+// tsCoversPlaylist reports whether the TS file at path spans the playlist's
+// full length, give or take one segment, meaning a previous run finished it.
+func tsCoversPlaylist(path string, segs *segmentList) bool {
+	span, err := tsPresentationSpan(path)
+	if err != nil {
+		return false
+	}
+	return span.Seconds() >= segs.duration-max(segs.target, 2)
 }
 
 func extractDuration(errStr string) string {
@@ -1458,10 +1588,11 @@ func video(ctx context.Context, videoID, uguID string, cfg *Config, streamParams
 		return fmt.Errorf("get video manifest base URL: %w", err)
 	}
 
-	segUrls, err := getSegUrls(ctx, manBaseUrl+variant.URI, query)
+	segs, err := getSegUrls(ctx, manBaseUrl+variant.URI, query)
 	if err != nil {
 		return fmt.Errorf("get video segment URLs: %w", err)
 	}
+	segUrls := segs.urls
 	if len(segUrls) == 0 {
 		return errors.New("video manifest has no segments")
 	}
@@ -1475,7 +1606,7 @@ func video(ctx context.Context, videoID, uguID string, cfg *Config, streamParams
 	fmt.Printf("%d Kbps, %s (%s)\n",
 		variant.Bandwidth/1000, retRes, variant.Resolution)
 	if isLstream {
-		err = downloadLstream(ctx, vidPathTs, manBaseUrl, segUrls)
+		err = downloadLstream(ctx, vidPathTs, manBaseUrl, segs)
 	} else {
 		err = downloadVideo(ctx, vidPathTs, manBaseUrl+segUrls[0])
 	}
@@ -1503,6 +1634,7 @@ func video(ctx context.Context, videoID, uguID string, cfg *Config, streamParams
 	if err := os.Remove(vidPathTs); err != nil {
 		fmt.Println("Failed to delete TS.")
 	}
+	os.Remove(progressPath(vidPathTs))
 	return nil
 }
 

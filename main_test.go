@@ -5,12 +5,15 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -464,27 +467,215 @@ func TestDownloadVideoInterruptKeepsPartialForResume(t *testing.T) {
 	}
 }
 
-func TestDownloadLstreamRemovesPartialOnFailure(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/bad.ts" {
+// segmentServer serves numbered segments, failing the ones in failOnce on
+// their first request, and counts requests per segment.
+type segmentServer struct {
+	*httptest.Server
+	mu       sync.Mutex
+	requests map[string]int
+	failOnce map[string]bool
+}
+
+func newSegmentServer(t *testing.T, failOnce ...string) *segmentServer {
+	t.Helper()
+	s := &segmentServer{requests: map[string]int{}, failOnce: map[string]bool{}}
+	for _, f := range failOnce {
+		s.failOnce[f] = true
+	}
+	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		s.requests[r.URL.Path]++
+		fail := s.failOnce[r.URL.Path]
+		delete(s.failOnce, r.URL.Path)
+		s.mu.Unlock()
+		if fail {
 			http.Error(w, "nope", http.StatusInternalServerError)
 			return
 		}
-		w.Write([]byte("segment"))
+		w.Write([]byte("<" + r.URL.Path + ">"))
 	}))
-	defer srv.Close()
+	t.Cleanup(s.Close)
+	return s
+}
+
+func (s *segmentServer) total() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, c := range s.requests {
+		n += c
+	}
+	return n
+}
+
+func testSegments(n int, token string) *segmentList {
+	segs := &segmentList{duration: float64(n) * 6, target: 6}
+	for i := range n {
+		segs.urls = append(segs.urls, fmt.Sprintf("seg%d.ts?token=%s", i, token))
+	}
+	return segs
+}
+
+func TestDownloadLstreamResumes(t *testing.T) {
+	srv := newSegmentServer(t, "/seg3.ts")
 	path := filepath.Join(t.TempDir(), "live.ts")
-	if err := downloadLstream(t.Context(), path, srv.URL+"/", []string{"ok.ts", "bad.ts"}); err == nil {
-		t.Fatal("downloadLstream succeeded")
+	want := "</seg0.ts></seg1.ts></seg2.ts></seg3.ts></seg4.ts>"
+
+	if err := downloadLstream(t.Context(), path, srv.URL+"/", testSegments(5, "a")); err == nil {
+		t.Fatal("first download succeeded despite a failing segment")
 	}
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("partial livestream file left behind: %v", err)
+	if got, _ := os.ReadFile(path); string(got) != want[:len("</seg0.ts>")*3] {
+		t.Fatalf("partial file = %q", got)
 	}
-	if err := downloadLstream(t.Context(), path, srv.URL+"/", []string{"ok.ts", "ok.ts"}); err != nil {
+	// The access token changes between runs; the download still resumes.
+	if err := downloadLstream(t.Context(), path, srv.URL+"/", testSegments(5, "b")); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := os.ReadFile(path); string(got) != "segmentsegment" {
+	if got, _ := os.ReadFile(path); string(got) != want {
+		t.Fatalf("file = %q, want %q", got, want)
+	}
+	for i := range 3 {
+		if n := srv.requests[fmt.Sprintf("/seg%d.ts", i)]; n != 1 {
+			t.Errorf("segment %d downloaded %d times, want once", i, n)
+		}
+	}
+	before := srv.total()
+	if err := downloadLstream(t.Context(), path, srv.URL+"/", testSegments(5, "c")); err != nil {
+		t.Fatal(err)
+	}
+	if srv.total() != before {
+		t.Error("a complete download was downloaded again")
+	}
+}
+
+func TestDownloadLstreamRestartsForDifferentPlaylist(t *testing.T) {
+	srv := newSegmentServer(t)
+	path := filepath.Join(t.TempDir(), "live.ts")
+	if err := os.WriteFile(path, []byte("old data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeProgress(progressPath(path), lstreamProgress{FirstSegment: "other.ts", Segments: 1, Bytes: 8}); err != nil {
+		t.Fatal(err)
+	}
+	if err := downloadLstream(t.Context(), path, srv.URL+"/", testSegments(2, "a")); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "</seg0.ts></seg1.ts>" {
 		t.Errorf("file = %q", got)
+	}
+}
+
+func TestDownloadLstreamRecognizesCompleteFileWithoutProgress(t *testing.T) {
+	// A finished download from a version that didn't record progress: about
+	// 3 seconds of video.
+	ts, _ := buildStream(t, streamOpts{video: true, audio: true, frames: 90, framesPerAudio: 3, videoStart: 900000, audioStart: 900000})
+	path := filepath.Join(t.TempDir(), "live.ts")
+	if err := os.WriteFile(path, ts, 0644); err != nil {
+		t.Fatal(err)
+	}
+	srv := newSegmentServer(t)
+	segs := &segmentList{urls: []string{"seg0.ts", "seg1.ts"}, duration: 3, target: 2}
+	if err := downloadLstream(t.Context(), path, srv.URL+"/", segs); err != nil {
+		t.Fatal(err)
+	}
+	if srv.total() != 0 {
+		t.Errorf("made %d requests for a complete file", srv.total())
+	}
+	if got, _ := os.ReadFile(path); !bytes.Equal(got, ts) {
+		t.Error("complete file was modified")
+	}
+
+	// The same file is too short for a 60-second playlist, so it's downloaded again.
+	other := filepath.Join(t.TempDir(), "live.ts")
+	if err := os.WriteFile(other, ts, 0644); err != nil {
+		t.Fatal(err)
+	}
+	segs.duration = 60
+	if err := downloadLstream(t.Context(), other, srv.URL+"/", segs); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(other); string(got) != "</seg0.ts></seg1.ts>" {
+		t.Errorf("file = %q", got)
+	}
+}
+
+func TestDownloadVideoCompleteWhenRangeIgnored(t *testing.T) {
+	full := bytes.Repeat([]byte("x"), 5000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Ignore the range, announce the whole file, then stall: reading the
+		// body would hang the test.
+		w.Header().Set("Content-Length", strconv.Itoa(len(full)))
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	path := filepath.Join(t.TempDir(), "video.ts")
+	if err := os.WriteFile(path, full, 0644); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- downloadVideo(t.Context(), path, srv.URL) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("downloadVideo started downloading a complete file again")
+	}
+	if got, _ := os.ReadFile(path); !bytes.Equal(got, full) {
+		t.Error("complete file was modified")
+	}
+}
+
+func TestDownloadVideoReplacesOversizedFile(t *testing.T) {
+	full := []byte("the real video")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "video.ts", time.Time{}, bytes.NewReader(full))
+	}))
+	defer srv.Close()
+	path := filepath.Join(t.TempDir(), "video.ts")
+	if err := os.WriteFile(path, []byte("a different, longer file"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := downloadVideo(t.Context(), path, srv.URL); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(path); !bytes.Equal(got, full) {
+		t.Errorf("file = %q, want %q", got, full)
+	}
+}
+
+func TestParseContentRange(t *testing.T) {
+	tests := []struct {
+		header       string
+		first, total int64
+	}{
+		{"bytes 100-199/1000", 100, 1000},
+		{"bytes */1000", -1, 1000},
+		{"bytes 0-99/*", 0, -1},
+		{"", -1, -1},
+	}
+	for _, tt := range tests {
+		if first, total := parseContentRange(tt.header); first != tt.first || total != tt.total {
+			t.Errorf("parseContentRange(%q) = %d, %d; want %d, %d", tt.header, first, total, tt.first, tt.total)
+		}
+	}
+}
+
+func TestTsPresentationSpan(t *testing.T) {
+	for _, start := range []int64{900000, tsWrap - 30*testFrameDur} {
+		ts, _ := buildStream(t, streamOpts{video: true, audio: true, frames: 90, framesPerAudio: 3, videoStart: start, audioStart: start})
+		path := filepath.Join(t.TempDir(), "video.ts")
+		if err := os.WriteFile(path, ts, 0644); err != nil {
+			t.Fatal(err)
+		}
+		span, err := tsPresentationSpan(path)
+		// 90 frames at 29.97 fps: the last frame starts about 2.97s after the first.
+		if err != nil || span < 2900*time.Millisecond || span > 3100*time.Millisecond {
+			t.Errorf("start %d: span = %v, %v; want about 2.97s", start, span, err)
+		}
 	}
 }
 

@@ -65,7 +65,7 @@ If you don't have root in Linux, you can have Nugs DL look for the binary in the
 # Usage
 Args take priority over the config file.
 
-Press Ctrl+C to stop. Partly downloaded tracks and livestreams are deleted, while a partly downloaded video is kept and resumed on the next run. The exit status is 0 when everything succeeded, 1 if any item failed, and 130 if interrupted.
+Press Ctrl+C to stop. Partly downloaded tracks are deleted. Partly downloaded videos are kept and resumed on the next run, and a video that finished downloading isn't downloaded again, even if converting it failed. The exit status is 0 when everything succeeded, 1 if any item failed, and 130 if interrupted.
 
 Download two albums:   
 `nugs_dl_x64.exe https://play.nugs.net/release/23329 https://play.nugs.net/release/23790`

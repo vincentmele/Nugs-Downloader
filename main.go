@@ -82,13 +82,14 @@ var urlRegexes = []*regexp.Regexp{
 	regexp.MustCompile(`^https://play\.nugs\.net/library/playlist/(\d+)$`),
 	regexp.MustCompile(`^(https://2nu\.gs/[a-zA-Z\d]+)$`),
 	regexp.MustCompile(`^https://play\.nugs\.net/#/videos/artist/\d+/.+/(\d+)$`),
-	regexp.MustCompile(`^https://play\.nugs\.net/artist/(\d+)(?:/albums|/latest|)$`),
+	regexp.MustCompile(`^https://play\.nugs\.net/(?:browse/)?artist/(\d+)(?:/albums|/latest|)$`),
 	regexp.MustCompile(`^https://play\.nugs\.net/livestream/(\d+)/exclusive$`),
 	regexp.MustCompile(`^https://play\.nugs\.net/watch/livestreams/exclusive/(\d+)$`),
 	regexp.MustCompile(`^https://play\.nugs\.net/#/my-webcasts/\d+-(\d+)-\d+-\d+$`),
 	regexp.MustCompile(`^https://www\.nugs\.net/on/demandware\.store/Sites-NugsNet-Site/default/` +
 		`(?:Stash-QueueVideo|NugsVideo-GetStashVideo)\?([a-zA-Z0-9=%&-]+)$`),
 	regexp.MustCompile(`^https://play\.nugs\.net/library/webcast/(\d+)$`),
+	regexp.MustCompile(`^https://play\.nugs\.net/watch/release/(\d+)$`),
 }
 
 // The first marker found in a stream URL wins, so HLS manifests come first and
@@ -1609,7 +1610,7 @@ func run() int {
 			itemErr = playlist(ctx, itemId, legacyToken, cfg, streamParams, false)
 		case 3:
 			itemErr = catalogPlist(ctx, itemId, legacyToken, cfg, streamParams)
-		case 4, 10:
+		case 4, 10, 11:
 			itemErr = video(ctx, itemId, "", cfg, streamParams, nil, false)
 		case 5:
 			itemErr = artist(ctx, itemId, cfg, streamParams)
